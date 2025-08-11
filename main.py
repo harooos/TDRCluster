@@ -4,6 +4,7 @@ from core.state import Query, Task, GraphState
 from core.graph import TDRClusterGraph
 from services.embedding_service import EmbeddingService
 import os
+from core.tools import visualize_category_tree
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ def main():
     # Make sure to have OPENAI_API_KEY set in your environment or .env file
 
     # Example: Load from CSV and generate embeddings if not already present
-    queries_df = pd.read_csv("data/queries.csv")
+    queries_df = pd.read_csv("data/sample.csv")
     all_queries = []
     for index, row in queries_df.iterrows():
         query_content = row["query"]
@@ -30,7 +31,8 @@ def main():
 
     # 2. Initialize the graph with an initial task
     # The initial k_value can be a heuristic or user-defined
-    initial_k = 5 # Example initial k
+
+    initial_k = 10 # Example initial k
 
     graph_runner = TDRClusterGraph()
     final_state = graph_runner.run(initial_queries=all_queries, initial_k=initial_k)
@@ -41,7 +43,7 @@ def main():
         print(f"Category ID: {category.id}")
         print(f"Description: {category.description}")
         print(f"Number of Queries: {len(category.queries)}")
-        print(f"Sample Queries: {', '.join(category.samples)}")
+        # print(f"Sample Queries: {', '.join(category.samples)}")
         print("---")
 
     # Optionally, save results to a CSV or JSON file
@@ -55,8 +57,12 @@ def main():
                 "category_description": category.description
             })
     output_df = pd.DataFrame(output_data)
-    output_df.to_csv("output_categories.csv", index=False)
+    output_df.to_csv("output/output_categories.csv", index=False)
     print("Results saved to output_categories.csv")
+    
+    # 在流程结束后添加可视化
+    print("\n--- 可视化类别树结构 ---")
+    visualize_category_tree(final_state["category_tree"])
 
 if __name__ == "__main__":
     main()
