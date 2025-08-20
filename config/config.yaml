@@ -1,0 +1,35 @@
+# TDRCluster 项目配置文件
+# 运行参数配置
+runtime:
+  dataset: "banking77"          # 默认数据集
+  high_level_goal: "银行用户的query数据集，对银行业务查询进行意图分类，目的是了解用户诉求的大致情况和分布"   # 运行目标
+  target_category_range: "50-70" # 目标类别范围配置 - 用于指导LLM进行合理的分类规模控制，自然语言描述
+
+  sample_size: null               # 采样大小（null表示使用全量数据） 
+# LLM配置 - 用于聚类决策和描述生成
+llm:
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "your-llm-api-key-here"
+  model_name: "doubao-seed-1-6-flash-250715"
+
+# Embedding配置 - 用于文本向量化
+embedding:
+  base_url: "https://api.siliconflow.cn/v1"
+  api_key: "your-embedding-api-key-here"
+  model_name: "Qwen/Qwen3-Embedding-8B"
+
+# 系统配置
+system:
+  recursion_limit: 100  # LangGraph递归限制
+
+# 聚类配置
+clustering:
+  initial_k: 5                 # 初始聚类数
+  
+  # 最小簇大小配置
+  min_cluster_size:
+    absolute: 10      # 绝对最小值
+    ratio: 0.005      # 相对比例 (5/1000)
+  
+  # 样本提取配置
+  max_samples_per_cluster: 10  # 每个cluster展示的最大样本数

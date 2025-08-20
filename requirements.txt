@@ -1,0 +1,11 @@
+pandas
+scikit-learn
+pydantic
+pydantic-settings
+langchain
+langgraph
+openai
+python-dotenv
+pyyaml
+tqdm
+numpy
