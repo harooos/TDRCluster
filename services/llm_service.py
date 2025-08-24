@@ -4,7 +4,9 @@ LLM服务
 from typing import Dict, Any, Optional, List
 import xml.etree.ElementTree as ET
 import re
-from openai import OpenAI
+import time
+import random
+from openai import OpenAI, RateLimitError
 
 
 class LLMService:
@@ -20,7 +22,7 @@ class LLMService:
         try:
             api_key = self.config.get('api_key')
             if not api_key:
-                print("❌ LLM API Key未配置")
+                print(" LLM API Key未配置")
                 return
             
             self.client = OpenAI(
@@ -29,15 +31,15 @@ class LLMService:
                 timeout=60  # 硬编码1分钟超时
             )
             
-            print(f"✓ LLM客户端初始化成功")
+            print(f" LLM客户端初始化成功")
             print(f"   模型: {self.config.get('model_name', 'unknown')}")
             
         except Exception as e:
-            print(f"❌ LLM客户端初始化失败: {e}")
+            print(f" LLM客户端初始化失败: {e}")
             self.client = None
     
-    def simple_call(self, prompt: str, system_message: Optional[str] = None) -> str:
-        """LLM调用接口"""
+    def simple_call(self, prompt: str, system_message: Optional[str] = None, max_retries: int = 5) -> str:
+        """LLM调用接口，包含处理RateLimitError的指数退避重试机制"""
         if not self.client:
             raise RuntimeError("LLM客户端未初始化")
         
@@ -46,17 +48,34 @@ class LLMService:
             messages.append({"role": "system", "content": system_message})
         messages.append({"role": "user", "content": prompt})
         
-        try:
-            response = self.client.chat.completions.create(
-                model=self.config.get('model_name'),
-                messages=messages,
-                temperature=0.0,  # 硬编码确定性输出
-                max_tokens=2000   # 硬编码足够的token限制
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"❌ LLM调用失败: {str(e)}")
-            raise
+        base_wait_time = 1  # 初始等待时间（秒）
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.get('model_name'),
+                    messages=messages,
+                    temperature=0.0,  # 硬编码确定性输出
+                    max_tokens=4000   # 增加token限制以应对更复杂的输出
+                )
+                return response.choices[0].message.content.strip()
+            
+            except RateLimitError as e:
+                wait_time = base_wait_time * (2 ** attempt) + random.uniform(0, 1)
+                print(f" LLM调用达到速率限制: {str(e)}")
+                if attempt < max_retries - 1:
+                    print(f"   将在 {wait_time:.2f} 秒后重试 (尝试 {attempt + 1}/{max_retries})...")
+                    time.sleep(wait_time)
+                else:
+                    print(f" LLM已达到最大重试次数 ({max_retries})，放弃调用。")
+                    raise
+            
+            except Exception as e:
+                print(f" LLM调用发生未知错误: {str(e)}")
+                raise
+        
+        # 如果所有重试都失败，这里实际上不会到达，因为最后一次尝试会重新抛出异常
+        raise RuntimeError("LLM调用在多次重试后仍然失败")
     
     def analyze_clusters_with_retry(self, finalized_categories: List[Dict[str, Any]], 
                                    clusters_to_review: List[Dict[str, Any]],
@@ -84,42 +103,33 @@ class LLMService:
         existing_categories = {cat['id']: cat for cat in finalized_categories}
         cluster_ids = [cluster['id'] for cluster in clusters_to_review]
         
-        # 首次尝试
-        try:
-            response = self.simple_call(prompt)
-            validation_result = self._validate_xml_response(response, cluster_ids, existing_categories)
-            
-            if validation_result['valid']:
-                print("✅ LLM响应验证通过")
-                return validation_result
-            else:
-                print(f"❌ LLM响应验证失败: {validation_result['error_message']}")
-                
-        except Exception as e:
-            print(f"❌ 初次LLM调用失败: {str(e)}")
-            validation_result = {'valid': False, 'error_message': f'LLM调用异常: {str(e)}'}
-        
-        # 重试机制
-        print("🔄 开始重试机制...")
+        validation_result = None
         for attempt in range(max_retries):
-            print(f"   尝试 {attempt + 1}/{max_retries}: 重新调用LLM")
-            
             try:
+                print(f"\n--- 开始第 {attempt + 1}/{max_retries} 次LLM决策尝试 ---")
                 response = self.simple_call(prompt)
                 validation_result = self._validate_xml_response(response, cluster_ids, existing_categories)
                 
                 if validation_result['valid']:
-                    print(f"   ✅ 重试成功，验证通过")
+                    print(" LLM响应验证通过")
                     return validation_result
                 else:
-                    print(f"   ❌ 重试 {attempt + 1} 验证失败: {validation_result['error_message']}")
-                    
+                    print(f" LLM响应验证失败: {validation_result['error_message']}")
+                    # 如果验证失败，准备下一次重试，不需要等待
+
             except Exception as e:
-                print(f"   ❌ 重试 {attempt + 1} 调用失败: {str(e)}")
+                # simple_call现在会处理API错误，所以这里的异常更可能是严重问题
+                print(f" LLM在第 {attempt + 1} 次尝试中发生严重错误: {str(e)}")
+                validation_result = {'valid': False, 'error_message': f'LLM调用或验证过程中发生严重异常: {str(e)}'}
+                # 发生严重错误时，可以选择中断重试
+                break
         
         # 所有重试都失败
-        print("❌ 所有重试失败，LLM无法正确响应")
-        raise RuntimeError(f"LLM响应验证连续失败，最后错误: {validation_result['error_message']}")
+        print(" LLM所有决策尝试均失败")
+        final_error = "未知错误" 
+        if validation_result and validation_result.get('error_message'):
+            final_error = validation_result['error_message']
+        raise RuntimeError(f"LLM响应在 {max_retries} 次尝试后仍无法验证通过，最后错误: {final_error}")
     
     def _validate_xml_response(self, xml_response: str, cluster_ids: List[str], 
                               existing_categories: Dict[str, Any] = None) -> Dict[str, Any]:

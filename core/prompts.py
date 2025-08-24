@@ -77,29 +77,65 @@ Based on this objective, analyze each cluster's semantic content thoughtfully an
 
 {existing_categories_xml}<task>
   <instruction>
-    For each cluster below, choose ONE action: create, assign, or subdivide.
+    Your goal is to categorize the clusters below. For each cluster, you must choose ONE of three actions: `assign`, `subdivide`, or `create`.
+
+    **Core Principle: Granularity is Key. Focus on Specific, Actionable User Intents.**
+    Your primary goal is to define categories that represent a *single, distinct, and actionable user intent*. Do not group queries by broad topics. A shared keyword (e.g., 'credit card') is insufficient. The queries must share a common, specific goal (e.g., 'apply for a credit card,' not 'credit card information').
+
+    **Bad, Topic-Based Categories (AVOID THESE):**
+    - "Credit Card Issues"
+    - "Account Information"
+    - "Technical Problems"
+    - "Product Questions"
+
+    **Your Decision-Making Flow (Internal Thoughts - Do NOT output this):**
+
+    1.  **Analyze the Cluster**: What is the core, specific *goal* of the users in this cluster? Is there only one goal or multiple?
+
+    2.  **PRIORITY 1: `assign`**: 
+        - **Question**: Does this cluster's single, specific intent perfectly match the intent of an *existing* category?
+        - **Action**: If yes, `assign` it. If the cluster's queries can enrich the existing category's description, provide a `description_update`.
+
+    3.  **PRIORITY 2: `subdivide`**:
+        - **Question**: Does this cluster contain multiple distinct user intents? Or does it represent a broad topic that needs to be broken down into specific intents?
+        - **Action**: If yes, `subdivide`. Determine the exact number of unique, specific intents (`k_value`) you can identify.
+
+    4.  **PRIORITY 3: `create`**:
+        - **Question**: Does this cluster represent a *single, cohesive, and new* user intent that doesn't fit any existing category?
+        - **Action**: If yes, and only then, `create` a new category. The description must be highly specific.
+
+    **Use Query Count as a Heuristic:**
+    The `query_count` for each cluster is a valuable signal for your decision-making.
+    - **High Query Count (e.g., >100)**: These clusters are often too broad. Be very cautious with `create`. prefer `subdivide` and use a higher `k_value` to break it down into more granular intents. A large cluster is unlikely to represent a single new intent.
+    - **Low Query Count (e.g., <20)**: These clusters are more likely to represent a niche, specific intent. They are good candidates for `create` if they are cohesive and don't fit existing categories, or for `assign` if they match one.
+
+    **Action Rules (For your final XML output):**
+    - **`assign`**: Provide `target_id`. Also provide `description_update` if you are refining the category description; otherwise, use `no_update`.
+    - **`subdivide`**: Provide a `k_value` (integer from 2 to 5) representing the number of distinct intents you've identified.
+    - **`create`**: Provide a rich `description` for the new category, following the required format.
     
-    **Decision Rules:**
-    - **create**: Create new meaningful category
-      - Support multiple clusters: "cluster-a,cluster-b" format if multiple clusters are related to a same category, use "cluster-a,cluster-b" format
-      - Use when you confirm that the cluster cannot be assigned to any existing category AND it is internally semantically coherent. 
-      - Provide Rich Description with specific examples
-      - Target: ONE new category
-    - **assign**: Enhance existing category by adding related content
-      - Support multiple clusters: "cluster-a,cluster-b" format, if multiple clusters are related to the same category, use "cluster-a,cluster-b" format
-      - Use when cluster content is related to an existing category and can refine/expand its scope
-      - Must specify target_id (ONE existing category) and description_update
-      - For description_update, choose "no_update" for perfect matches, or provide refined description for semantic expansion
-    - **subdivide**: Split cluster into smaller clusters  
-      - Single cluster only
-      - Use when cluster contains multiple categories that can be separated
-      - Choose k_value wisely: should be larger than the number of themes you identify, giving the algorithm room to separate them effectively
-    
-    **CRITICAL**: Every cluster must appear in exactly one decision. No cluster should be missed or duplicated.
+    **CRITICAL**: Every cluster must be judged exactly once. Your final output must be a single `<decisions>` XML block as shown in the example.
   </instruction>
   
   {clusters_xml}
 </task>
+
+<good_vs_bad_examples>
+  To help you understand the required granularity, here are examples:
+
+  **Example 1: A cluster about 'Credit Cards'**
+  - **BAD DECISION**: `create` a single category named "Credit Card Issues". This is too broad.
+  - **GOOD DECISION**: `subdivide` the cluster into multiple, specific intent-based categories like:
+    - Category A: "Credit Card Application & Status" (queries: 'how to apply', 'check my application status')
+    - Category B: "Credit Card Billing & Payments" (queries: 'when is my bill due', 'how to pay my bill')
+    - Category C: "Reporting Lost or Stolen Cards" (queries: 'I lost my card', 'someone stole my wallet')
+
+  **Example 2: A cluster about 'Account Information'**
+  - **BAD DECISION**: `create` a single category named "Account Info".
+  - **GOOD DECISION**: `subdivide` it into:
+    - Category A: "Checking Account Balance" (queries: 'what's my balance', 'how much money do I have')
+    - Category B: "Updating Personal Information" (queries: 'change my address', 'update my phone number')
+</good_vs_bad_examples>
 
 <format_requirements>
   Your entire response must be a single XML block with <decisions> as the root element:
@@ -188,9 +224,3 @@ def create_cluster_display_dict(cluster: Cluster) -> Dict[str, Any]:
         'samples': cluster.samples,
         'query_count': len(cluster.queries)
     }
-
-
-
-
-
-

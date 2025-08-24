@@ -1,5 +1,3 @@
-pandas
-scikit-learn
 pydantic
 pydantic-settings
 langchain
@@ -9,3 +7,5 @@ python-dotenv
 pyyaml
 tqdm
 numpy
+pandas==2.2.2
+scikit-learn==1.5.0
