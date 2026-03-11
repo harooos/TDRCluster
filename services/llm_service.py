@@ -37,7 +37,13 @@ class LLMService:
             print(f"❌ LLM客户端初始化失败: {e}")
             self.client = None
 
-    def simple_call(self, prompt: str, system_message: Optional[str] = None) -> str:
+    def simple_call(
+        self,
+        prompt: str,
+        system_message: Optional[str] = None,
+        max_tokens: int = 2000,
+        timeout: Optional[float] = None,
+    ) -> str:
         """LLM调用接口"""
         if not self.client:
             raise RuntimeError("LLM客户端未初始化")
@@ -52,7 +58,8 @@ class LLMService:
                 model=self.config.get("model_name"),
                 messages=messages,
                 temperature=0.0,
-                max_tokens=2000,
+                max_tokens=max_tokens,
+                timeout=timeout,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
