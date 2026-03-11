@@ -1,6 +1,7 @@
 """
 数据集管理器
 """
+import pickle
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -40,6 +41,34 @@ class DatasetManager:
         embeddings_file = processed_dir / f"{dataset_name}_embeddings.npz"
         
         return metadata_file.exists() and embeddings_file.exists()
+
+    def _progress_file(self, dataset_name: str) -> Path:
+        processed_dir = self.processed_path / dataset_name
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        return processed_dir / f"{dataset_name}_embedding_progress.pkl"
+
+    def _load_embedding_progress(self, dataset_name: str) -> Dict[str, Any]:
+        progress_file = self._progress_file(dataset_name)
+        if not progress_file.exists():
+            return {"next_index": 0, "data": []}
+
+        with open(progress_file, "rb") as file:
+            progress = pickle.load(file)
+
+        next_index = int(progress.get("next_index", 0))
+        data = progress.get("data", [])
+        print(f"   检测到embedding断点缓存: 已完成 {next_index} 条")
+        return {"next_index": next_index, "data": data}
+
+    def _save_embedding_progress(self, dataset_name: str, next_index: int, data: List[Dict[str, Any]]):
+        progress_file = self._progress_file(dataset_name)
+        with open(progress_file, "wb") as file:
+            pickle.dump({"next_index": next_index, "data": data}, file)
+
+    def _clear_embedding_progress(self, dataset_name: str):
+        progress_file = self._progress_file(dataset_name)
+        if progress_file.exists():
+            progress_file.unlink()
     
     
     def generate_embeddings(self, dataset_name: str, force_regenerate: bool = False) -> str:
@@ -82,11 +111,18 @@ class DatasetManager:
         
         print("   开始生成embeddings...")
         
-        # 批量处理 - doubao API限制每次最多256条
+        progress_file = self._progress_file(dataset_name)
+        if force_regenerate and progress_file.exists():
+            self._clear_embedding_progress(dataset_name)
+
+        progress = self._load_embedding_progress(dataset_name)
+
+        # 批量处理
         batch_size = 256
-        data_for_embedding = []
+        data_for_embedding = progress["data"]
+        start_index = progress["next_index"]
         
-        for batch_start in range(0, len(df), batch_size):
+        for batch_start in range(start_index, len(df), batch_size):
             batch_end = min(batch_start + batch_size, len(df))
             batch_df = df.iloc[batch_start:batch_end]
             
@@ -103,6 +139,7 @@ class DatasetManager:
                         'embedding': embedding
                     })
                 
+                self._save_embedding_progress(dataset_name, batch_end, data_for_embedding)
                 print(f"   进度: {batch_end}/{len(df)} (批次处理)")
                     
             except Exception as e:
@@ -128,6 +165,7 @@ class DatasetManager:
         
         # 保存数据
         saved_path = embedding_service.save_embeddings(data_for_embedding, dataset_name)
+        self._clear_embedding_progress(dataset_name)
         print(f"✓ Embeddings已保存到: {saved_path}")
         
         return saved_path

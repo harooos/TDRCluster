@@ -2,14 +2,15 @@
 
 **LLM驱动的动态意图聚类系统**
 
-一个基于大语言模型的智能聚类系统，专门用于无标签用户查询的自动化意图分类。采用"自顶向下"的细分策略，结合LLM的语义理解能力，生成具有明确业务含义的高质量聚类结果。
+一个面向无标签用户查询的动态意图聚类系统。当前版本采用单一 BFS 队列状态机，将“物理切分”和“语义收敛”拆分给不同引擎：`UMAP + HDBSCAN` 负责物理提纯，LLM 负责维护 running taxonomy。
 
 ## 🌟 核心特性
 
-- **🧠 LLM驱动**: 使用大语言模型进行语义理解和聚类决策
-- **🔄 迭代细分**: 采用队列式BFS算法，自顶向下逐层细分
-- **🎯 智能决策**: 支持创建、分配、细分三种决策模式  
-- **🏷️ 自动描述**: 为每个类别生成包含典型样本的描述
+- **🧠 双引擎架构**: `UMAP + HDBSCAN` 负责物理切分，LLM 负责语义裁决
+- **🔄 BFS 状态机**: 采用统一队列循环，持续处理 root task 与后续 resplit task
+- **🎯 Taxonomy维护**: 支持 `create / merge / split` 三种核心语义动作，`merge` 可按需更新已有类别的名称、定义和边界
+- **🏷️ 结构化类别**: 类别包含 `name / definition / boundary_notes / positive_examples`
+- **🧹 残差池**: 显式记录噪声簇与无法继续稳定切分的残差簇
 - **📊 多数据集**: 支持banking77等标准数据集，也支持自定义CSV数据
 - **🔧 多provider**: 支持各种LLM服务提供商
 
@@ -31,9 +32,13 @@ pip install -r requirements.txt
 
 ### 配置
 
-编辑 `config/config.yaml`：
+复制 `config/config.example.yaml` 为本地 `config/config.yaml` 后再编辑：
 
 ```yaml
+runtime:
+  dataset: "banking77"
+  taxonomy_context: null  # 可选：补充领域背景或命名偏好
+
 # LLM配置
 llm:
   base_url: "your-llm-api-base-url" 
@@ -47,18 +52,15 @@ embedding:
   model_name: "your-embedding-model"
 ```
 
+`taxonomy_context` 是可选的。如果不填，reviewer 只依据已有 taxonomy 和当前 micro-cluster 样本做判断。
+
 ### 运行
 
 ```bash
-# 使用banking77数据集
 python main.py
-
-# 使用自定义数据集
-python main.py --dataset your_dataset
-
-# 快速测试（采样）
-python main.py --sample 100
 ```
+
+当前版本通过 `config/config.yaml` 控制运行数据集、采样规模与物理切分参数。
 
 ## 📁 项目结构
 
@@ -86,11 +88,12 @@ TDRCluster/
 
 ## ⚙️ 工作流程
 
-1. **数据准备**: 自动检测CSV格式，生成文本向量
-2. **初始聚类**: 使用K-Means进行初始聚类
-3. **LLM审查**: 分析cluster质量，决策下一步操作
-4. **动态调整**: 执行创建/分配/细分操作
-5. **迭代优化**: 循环执行直到达到最佳聚类效果
+1. **数据准备**: 加载 CSV，并为 query 生成或读取 embedding
+2. **Root Task 入队**: 将全量 query 作为未分化大簇放入 BFS 队列
+3. **物理切分**: 使用 `UMAP + HDBSCAN` 生成 micro-clusters 与 residual clusters
+4. **LLM 审查**: 结合 running taxonomy 对每个 micro-cluster 做 `create / merge / split`
+5. **动态收敛**: 更新 taxonomy，或把仍不纯的 cluster 重新入队继续切分
+6. **结果输出**: 导出分类结果与 residual pool 摘要
 
 ## 🔧 自定义数据集
 
@@ -98,9 +101,9 @@ TDRCluster/
 
 ```csv
 query
-"我的银行卡余额不够了"
-"怎么查看交易记录" 
-"账户被锁定了怎么办"
+"I need to reset my account password"
+"How can I change the shipping address for my order?"
+"The app crashes when I try to upload a file"
 ```
 
 将文件放入 `data/raw_data/` 目录，系统会自动处理。
@@ -109,6 +112,11 @@ query
 
 - **详细结果**: `output/dataset_clustering_timestamp.csv`
 - **摘要报告**: `output/dataset_summary_timestamp.json`
+
+摘要报告会同时包含：
+
+- 最终 taxonomy 的结构化类别信息
+- residual cluster 的数量、样本与残差原因
 
 ## 🤝 贡献
 

@@ -1,196 +1,182 @@
 """
 Prompt模板模块
-包含LLM交互的所有Prompt模板，支持最新的多cluster创建单category功能
-现在包含LLM调用功能
+包含LLM交互的所有Prompt模板
 """
-from typing import List, Dict, Any
-from .state import Category, Cluster
+from typing import List, Dict, Any, Optional
+
+from .state import Category, MicroCluster
 
 
-def create_review_prompt(finalized_categories: List[Dict[str, Any]], 
-                        clusters_to_review: List[Dict[str, Any]],
-                        dataset_name: str = None) -> str:
-    """
-    生成第一轮LLM决策的Prompt模板
-    
-    Args:
-        finalized_categories: 已确定的类别列表（包含Rich Description）
-        clusters_to_review: 待评审的clusters列表
-        dataset_name: 数据集名称，用于获取特定的high-level目标
-        
-    Returns:
-        str: 完整的prompt字符串
-    """
-    
-    # 获取high-level目标配置
+def create_reviewer_system_prompt() -> str:
+    """生成reviewer的系统提示"""
+    return """You maintain a running intent taxonomy over semantically coherent micro-clusters.
+
+Core principles:
+- Prioritize semantic correctness over any preset target number of categories.
+- Produce flat leaf-level categories in this stage. Do not invent parent-child hierarchy here.
+- Keep category boundaries stable, reusable, and easy for humans to understand.
+- Avoid unnecessary fragmentation. Prefer merge when an existing category can absorb the new evidence without becoming vague.
+- Use create only when the cluster expresses a genuinely new reusable intent.
+- Use split only when the cluster still clearly mixes multiple distinct intents and should be sent back for further physical splitting.
+- Category names should be concise, domain-faithful, and reusable.
+- If a merge broadens the meaning of an existing category, update the category name only when the current name becomes too narrow or misleading.
+- Follow the dominant language of the existing taxonomy and cluster samples when writing names, definitions, and boundary notes. If the taxonomy already has a dominant language, stay consistent with it.
+- Return exactly one XML <decisions> block and nothing else."""
+
+
+def create_review_prompt(
+    finalized_categories: List[Dict[str, Any]],
+    cluster_to_review: Dict[str, Any],
+) -> str:
+    """生成V2 reviewer使用的用户提示"""
     from config.config_loader import CONFIG
-    runtime_config = CONFIG.get('runtime', {})
-    
-    # 优先使用runtime中的high_level_goal，然后使用默认目标
-    high_level_goal = runtime_config.get('high_level_goal')
-    if not high_level_goal:
-        high_level_goal = "对用户查询进行智能意图分类，生成具有明确业务含义的高质量类别"
-    
-    # 获取目标类别范围
-    target_range = runtime_config.get('target_category_range', '15')
-    
-    
-    # 构建现有类别展示
-    existing_categories_xml = ""
-    if finalized_categories:
-        existing_categories_xml = "<existing_categories>\n"
-        for cat in finalized_categories:
-            existing_categories_xml += f"""  <category>
-    <id>{cat['id']}</id>
-    <description>{cat['description']}</description>
-    <query_count>{len(cat.get('queries', []))}</query_count>
-  </category>\n"""
-        existing_categories_xml += "</existing_categories>\n\n"
-    else:
-        existing_categories_xml = "<existing_categories>\n  <!-- 暂无已确定的类别 -->\n</existing_categories>\n\n"
-    
-    # 构建待评审clusters展示
-    clusters_xml = "<clusters_to_review>\n"
-    for cluster in clusters_to_review:
-        # 获取samples，直接使用clustering阶段已抽取的样本，避免重复抽样
-        samples = cluster.get('samples', [])  # 使用clustering_service已抽取的样本
-        samples_str = ', '.join([sample[:50] + ('...' if len(sample) > 50 else '') for sample in samples])
-        
-        query_count = len(cluster.get('queries', []))
-        
-        clusters_xml += f"""  <cluster id="{cluster['id']}">
-    <samples>{samples_str}</samples>
-    <query_count>{query_count}</query_count>
-  </cluster>\n"""
-    clusters_xml += "</clusters_to_review>"
-    
-    # 构建完整prompt
-    prompt = f"""<role>You are an expert data analyst. Your task is to review unlabeled query clusters and output your decisions in a structured XML format. You must ensure EVERY cluster is judged exactly once.</role>
 
-<high_level_goal>
-{high_level_goal}
+    runtime_config = CONFIG.get("runtime", {})
+    taxonomy_context = runtime_config.get("taxonomy_context")
 
-Based on this objective, analyze each cluster's semantic content thoughtfully and make intelligent classification decisions. Ensure every cluster is appropriately categorized to achieve comprehensive, balanced, and meaningful classification across the entire dataset. Pay careful attention to the semantic hierarchy, consistency, and logical coherence of the overall category structure.
+    context_xml = _create_context_block(taxonomy_context)
+    existing_categories_xml = _create_existing_categories_block(finalized_categories)
+    cluster_xml = _create_cluster_block(cluster_to_review)
 
-**Target Category Count**: Aim for {target_range} final categories in total. Keep this range in mind when making decisions to achieve optimal classification granularity, only the subdivide action can increase the number of categories.
-</high_level_goal>
-
-{existing_categories_xml}<task>
+    return f"""{context_xml}{existing_categories_xml}
+<task>
   <instruction>
-    For each cluster below, choose ONE action: create, assign, or subdivide.
-    
-    **Decision Rules:**
-    - **create**: Create new meaningful category
-      - Support multiple clusters: "cluster-a,cluster-b" format if multiple clusters are related to a same category, use "cluster-a,cluster-b" format
-      - Use when you confirm that the cluster cannot be assigned to any existing category AND it is internally semantically coherent. 
-      - Provide Rich Description with specific examples
-      - Target: ONE new category
-    - **assign**: Enhance existing category by adding related content
-      - Support multiple clusters: "cluster-a,cluster-b" format, if multiple clusters are related to the same category, use "cluster-a,cluster-b" format
-      - Use when cluster content is related to an existing category and can refine/expand its scope
-      - Must specify target_id (ONE existing category) and description_update
-      - For description_update, choose "no_update" for perfect matches, or provide refined description for semantic expansion
-    - **subdivide**: Split cluster into smaller clusters  
-      - Single cluster only
-      - Use when cluster contains multiple categories that can be separated
-      - Choose k_value wisely: should be larger than the number of themes you identify, giving the algorithm room to separate them effectively
-    
-    **CRITICAL**: Every cluster must appear in exactly one decision. No cluster should be missed or duplicated.
+    Review the single micro-cluster below and choose exactly ONE action: create, merge, or split.
+
+    Decision rules:
+    - create:
+      Use when this micro-cluster expresses a new intent that is not covered by the current taxonomy.
+      Only create when the intent is stable and reusable beyond these specific examples.
+      You must provide:
+      - name
+      - definition
+      - boundary_notes
+
+    - merge:
+      Use when this micro-cluster belongs to an existing category.
+      Prefer merge when the existing category can absorb the cluster without losing clarity.
+      You must provide:
+      - target_id
+      - name_update
+      - definition_update
+      - boundary_update
+      Use "no_update" for any field that does not need revision.
+      Only update the name when the existing name has become too narrow or inaccurate after the merge.
+
+    - split:
+      Use when this micro-cluster is still semantically mixed and should be sent back for another round of physical splitting.
+      Do not use split merely to chase a finer taxonomy.
+      You must provide:
+      - reason
+
+    Hard constraints:
+    - Review exactly one micro-cluster in this call.
+    - Return exactly one <decision>.
+    - Each decision must reference exactly one micro-cluster id.
+    - Do not output noise decisions. Noise is handled by the system.
   </instruction>
-  
-  {clusters_xml}
+
+  {cluster_xml}
 </task>
 
 <format_requirements>
-  Your entire response must be a single XML block with <decisions> as the root element:
-  
+  Your response must be a single XML block with <decisions> as the root element.
+  It must contain exactly one <decision>.
+
   <decisions>
     <decision>
-      <id>cluster-id(s)</id>
-      <action>create|assign|subdivide</action>
-      <!-- For CREATE: provide description -->
-      <!-- For ASSIGN: provide target_id and description_update -->
-      <!-- For SUBDIVIDE: provide k_value -->
+      <id>micro-cluster-id</id>
+      <action>create|merge|split</action>
+      <!-- CREATE -->
+      <name>category name</name>
+      <definition>semantic definition</definition>
+      <boundary_notes>what belongs here and what does not</boundary_notes>
+      <!-- MERGE -->
+      <target_id>CAT-001</target_id>
+      <name_update>no_update or refined category name</name_update>
+      <definition_update>no_update or refined definition</definition_update>
+      <boundary_update>no_update or refined boundary notes</boundary_update>
+      <!-- SPLIT -->
+      <reason>why this cluster still mixes multiple intents</reason>
     </decision>
-    <!-- More decisions... -->
   </decisions>
-  
-  For CREATE actions, provide Rich Description with this format:
-  "主要描述 - 详细解释和覆盖范围\\n典型例子：具体例子1、例子2、例子3"
 </format_requirements>
 
 <example>
   <decisions>
     <decision>
-      <id>temp-c,temp-d</id>
-      <action>create</action>
-      <description>用户寻求客户服务支持 - 包括联系客服、退货退款、问题解决等服务请求
-      典型例子：怎么联系客服、我要退货、退款多久到账、怎么投诉</description>
-    </decision>
-    <decision>
-      <id>temp-a,temp-e</id>
-      <action>assign</action>
-      <target_id>CAT-001</target_id>
-      <description_update>用户关于订单和物流的全程关注 - 涵盖发货通知、物流追踪、配送状态、时效查询等订单履约全链路问题
-      典型例子：什么时候发货、我的订单到哪了、快递什么时候到、为什么物流信息不更新、预计多久能到</description_update>
-    </decision>
-    <decision>
-      <id>temp-b</id>
-      <action>subdivide</action>
-      <k_value>4</k_value>
-    </decision>
-    <decision>
-      <id>temp-f</id>
-      <action>subdivide</action>
-      <k_value>3</k_value>
+      <id>mc-001</id>
+      <action>merge</action>
+      <target_id>CAT-003</target_id>
+      <name_update>no_update</name_update>
+      <definition_update>no_update</definition_update>
+      <boundary_update>Extend the boundary to include requests about changing the delivery address after an order is placed.</boundary_update>
     </decision>
   </decisions>
 </example>
 
-Please provide your decisions now in the required <decisions> XML format:"""
+Please provide your decision now in the required XML format:"""
 
-    return prompt
 
+def _create_context_block(taxonomy_context: Optional[str]) -> str:
+    if not taxonomy_context:
+        return ""
+
+    return f"""<taxonomy_context>
+{taxonomy_context}
+</taxonomy_context>
+
+"""
+
+
+def _create_existing_categories_block(finalized_categories: List[Dict[str, Any]]) -> str:
+    existing_categories_xml = "<existing_categories>\n"
+    if finalized_categories:
+        for cat in finalized_categories:
+            positive_examples = " | ".join(cat.get("positive_examples", [])[:3]) or "none"
+            existing_categories_xml += f"""  <category>
+    <id>{cat['id']}</id>
+    <name>{cat['name']}</name>
+    <definition>{cat['definition']}</definition>
+    <boundary_notes>{cat['boundary_notes'] or 'none'}</boundary_notes>
+    <query_count>{cat['query_count']}</query_count>
+    <positive_examples>{positive_examples}</positive_examples>
+  </category>\n"""
+    else:
+        existing_categories_xml += "  <!-- No finalized categories yet -->\n"
+    existing_categories_xml += "</existing_categories>"
+    return existing_categories_xml
+
+
+def _create_cluster_block(cluster: Dict[str, Any]) -> str:
+    samples = " | ".join(cluster.get("sample_texts", [])) or "none"
+    return f"""<micro_cluster_to_review>
+  <cluster>
+    <id>{cluster['id']}</id>
+    <depth>{cluster['depth']}</depth>
+    <query_count>{cluster['query_count']}</query_count>
+    <samples>{samples}</samples>
+  </cluster>
+</micro_cluster_to_review>"""
 
 
 def create_category_display_dict(category: Category) -> Dict[str, Any]:
-    """
-    将Category对象转换为展示用的字典格式
-    
-    Args:
-        category: Category对象
-        
-    Returns:
-        Dict[str, Any]: 用于展示的字典
-    """
+    """将Category对象转换为展示用的字典格式"""
     return {
-        'id': category.id,
-        'description': category.description,
-        'queries': category.queries,
-        'query_count': len(category.queries),
-        'samples': category.samples
+        "id": category.id,
+        "name": category.name,
+        "definition": category.definition,
+        "boundary_notes": category.boundary_notes,
+        "query_count": len(category.queries),
+        "positive_examples": category.positive_examples,
     }
 
 
-def create_cluster_display_dict(cluster: Cluster) -> Dict[str, Any]:
-    """
-    将Cluster对象转换为展示用的字典格式
-    
-    Args:
-        cluster: Cluster对象
-        
-    Returns:
-        Dict[str, Any]: 用于展示的字典
-    """
+def create_cluster_display_dict(cluster: MicroCluster) -> Dict[str, Any]:
+    """将MicroCluster对象转换为展示用的字典格式"""
     return {
-        'id': cluster.id,
-        'queries': cluster.queries,
-        'samples': cluster.samples,
-        'query_count': len(cluster.queries)
+        "id": cluster.id,
+        "depth": cluster.depth,
+        "query_count": len(cluster.queries),
+        "sample_texts": cluster.sample_texts,
     }
-
-
-
-
-
-

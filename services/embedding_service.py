@@ -1,7 +1,12 @@
 """
 Embedding服务
 """
+import json
 import pickle
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib import request, error
+
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any
@@ -16,25 +21,32 @@ class EmbeddingService:
     
     def __init__(self):
         self.config = CONFIG.get('embedding', {})
+        self.api_style = self.config.get('api_style', 'openai')
         self.client = None
         self._init_client()
     
     def _init_client(self):
-        """初始化OpenAI客户端"""
+        """初始化embedding客户端"""
         try:
             api_key = self.config.get('api_key')
             
             if not api_key:
                 print("❌ Embedding API Key未配置")
                 return
-            
-            self.client = OpenAI(
-                api_key=api_key,
-                base_url=self.config.get('base_url'),
-                timeout=60  # 硬编码1分钟超时
-            )
-            
+
+            if self.api_style == 'openai':
+                self.client = OpenAI(
+                    api_key=api_key,
+                    base_url=self.config.get('base_url'),
+                    timeout=60
+                )
+            elif self.api_style == 'ark_multimodal':
+                self.client = True
+            else:
+                raise ValueError(f"不支持的embedding api_style: {self.api_style}")
+
             print(f"✓ Embedding客户端初始化成功")
+            print(f"   接口风格: {self.api_style}")
             print(f"   模型: {self.config.get('model_name', 'unknown')}")
             
         except Exception as e:
@@ -50,14 +62,87 @@ class EmbeddingService:
             
         try:
             cleaned_texts = [text.replace("\n", " ") for text in texts]
-            response = self.client.embeddings.create(
-                input=cleaned_texts,
-                model=self.config.get('model_name')
-            )
-            return [item.embedding for item in response.data]
+            if self.api_style == 'openai':
+                response = self.client.embeddings.create(
+                    input=cleaned_texts,
+                    model=self.config.get('model_name')
+                )
+                return [item.embedding for item in response.data]
+
+            if self.api_style == 'ark_multimodal':
+                return self._get_ark_multimodal_embeddings(cleaned_texts)
+
+            raise ValueError(f"不支持的embedding api_style: {self.api_style}")
         except Exception as e:
             print(f"❌ 获取embeddings失败: {str(e)}")
             raise
+
+    def _get_ark_multimodal_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        使用方舟 /embeddings/multimodal 接口生成文本embedding。
+        该接口一次请求返回一个embedding，因此这里对输入文本逐条请求，
+        再通过线程池做轻量并发以减少总耗时。
+        """
+        max_concurrency = max(1, int(self.config.get('max_concurrency', 16)))
+        if len(texts) == 1:
+            return [self._request_ark_multimodal_embedding(texts[0])]
+
+        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(texts))) as executor:
+            return list(executor.map(self._request_ark_multimodal_embedding, texts))
+
+    def _request_ark_multimodal_embedding(self, text: str) -> List[float]:
+        endpoint_path = self.config.get('endpoint_path', '/embeddings/multimodal')
+        base_url = self.config.get('base_url', '').rstrip('/')
+        url = f"{base_url}{endpoint_path}"
+
+        payload = {
+            "model": self.config.get('model_name'),
+            "input": [
+                {
+                    "type": "text",
+                    "text": text,
+                }
+            ],
+        }
+
+        raw_body = json.dumps(payload).encode('utf-8')
+        http_request = request.Request(
+            url=url,
+            data=raw_body,
+            method='POST',
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f"Bearer {self.config.get('api_key')}",
+                'Connection': 'close',
+            },
+        )
+
+        timeout_seconds = int(self.config.get('timeout', 60))
+        max_retries = max(1, int(self.config.get('max_retries', 4)))
+        retry_delay_seconds = float(self.config.get('retry_delay_seconds', 1.0))
+
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                with request.urlopen(http_request, timeout=timeout_seconds) as response:
+                    response_body = response.read().decode('utf-8')
+                response_json = json.loads(response_body)
+                embedding = response_json.get('data', {}).get('embedding')
+                if not embedding:
+                    raise RuntimeError(f"方舟multimodal embedding响应缺少embedding字段: {response_json}")
+                return embedding
+            except error.HTTPError as http_error:
+                error_body = http_error.read().decode('utf-8', errors='replace')
+                last_error = RuntimeError(
+                    f"方舟multimodal embedding请求失败: {http_error.code} {error_body}"
+                )
+            except Exception as exc:
+                last_error = exc
+
+            if attempt < max_retries:
+                time.sleep(retry_delay_seconds * attempt)
+
+        raise RuntimeError(f"方舟multimodal embedding重试失败: {last_error}") from last_error
     
     def save_embeddings(self, data: List[Dict[str, Any]], dataset_name: str) -> str:
         """保存embeddings数据"""

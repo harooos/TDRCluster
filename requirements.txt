@@ -9,3 +9,5 @@ python-dotenv
 pyyaml
 tqdm
 numpy
+umap-learn
+hdbscan

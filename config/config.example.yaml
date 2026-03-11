@@ -1,0 +1,40 @@
+# TDRCluster 项目配置文件示例
+runtime:
+  dataset: "banking77"
+  taxonomy_context: null
+  sample_size: null
+
+llm:
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "your-llm-api-key-here"
+  model_name: "doubao-seed-2-0-mini-260215"
+
+embedding:
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "your-embedding-api-key-here"
+  api_style: "ark_multimodal"
+  endpoint_path: "/embeddings/multimodal"
+  model_name: "doubao-embedding-vision-251215"
+  max_concurrency: 4
+  max_retries: 4
+  retry_delay_seconds: 1.0
+  timeout: 60
+
+system:
+  recursion_limit: 2000
+
+clustering:
+  max_split_depth: 4
+  max_samples_per_cluster: 8
+  min_cluster_size:
+    absolute: 10
+    ratio: 0.005
+  umap:
+    n_neighbors: 15
+    n_components: 10
+    min_dist: 0.0
+    metric: "cosine"
+  hdbscan:
+    min_samples: null
+    metric: "euclidean"
+    cluster_selection_method: "eom"

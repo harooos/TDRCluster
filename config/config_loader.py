@@ -13,16 +13,25 @@ def _load_config() -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: 配置字典
     """
-    config_path = Path(__file__).parent / "config.yaml"
-    
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        print(f"✓ 配置文件加载成功: {config_path}")
-        return config
-    except Exception as e:
-        print(f"❌ 配置文件加载失败: {e}")
-        return {}
+    config_dir = Path(__file__).parent
+    config_path = config_dir / "config.yaml"
+    example_path = config_dir / "config.example.yaml"
+
+    for candidate in (config_path, example_path):
+        if not candidate.exists():
+            continue
+
+        try:
+            with open(candidate, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            print(f"✓ 配置文件加载成功: {candidate}")
+            return config
+        except Exception as e:
+            print(f"❌ 配置文件加载失败: {e}")
+            return {}
+
+    print(f"❌ 配置文件加载失败: 未找到 {config_path.name} 或 {example_path.name}")
+    return {}
 
 
 # 模块加载时直接初始化全局CONFIG

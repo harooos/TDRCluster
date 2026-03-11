@@ -53,6 +53,7 @@ data/processed_data/
 .env
 config.env
 *.key
+config/config.yaml
 
 # Jupyter
 .ipynb_checkpoints/
@@ -65,4 +66,3 @@ test_*.py
 # Development artifacts
 backup/
 temp/
-
