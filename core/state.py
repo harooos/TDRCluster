@@ -59,6 +59,8 @@ class MicroCluster(BaseModel):
     evidence_rounds: List[Dict[str, Any]] = Field(default_factory=list)
     inspect_round: int = 0
     inspect_reasons: List[str] = Field(default_factory=list)
+    allow_inspect: bool = True
+    inspect_stop_reason: Optional[str] = None
     is_noise: bool = False
     judge: Optional[Dict[str, Any]] = None
 

@@ -2,14 +2,14 @@
 LangGraph流程编排模块
 实现TDRCluster V2的完整工作流：splitter -> reviewer -> dispatcher
 """
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from collections import deque
 
 from langgraph.graph import StateGraph, END
 
 from config.config_loader import CONFIG
 
-from .state import GraphState, Query, SplitTask
+from .state import GraphState, Query, SplitTask, MicroCluster
 from .tools import (
     create_new_category_tool,
     merge_into_existing_category_tool,
@@ -26,6 +26,7 @@ class TDRClusterGraph:
     def __init__(self, llm_service):
         self.llm_service = llm_service
         self.clustering_service = ClusteringService()
+        self.inspect_config = CONFIG.get("clustering", {}).get("inspect", {})
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -188,6 +189,19 @@ class TDRClusterGraph:
                     current_cluster,
                     decision.get("reason", "semantic_impurity"),
                 )
+            elif action == "inspect":
+                updated_clusters = self._handle_inspect_request(
+                    state,
+                    current_cluster,
+                    decision.get("reason", "need_more_evidence"),
+                )
+                return {
+                    "tasks": state.get("tasks", deque()),
+                    "categories": state.get("categories", {}),
+                    "clusters_list": updated_clusters,
+                    "current_cluster": None,
+                    "residual_clusters": state.get("residual_clusters", []),
+                }
             else:
                 record_residual_cluster_tool(state, current_cluster, f"未知动作: {action}")
         except Exception as e:
@@ -214,6 +228,95 @@ class TDRClusterGraph:
 
         print("   队列为空，结束流程")
         return "end"
+
+    def _handle_inspect_request(
+        self,
+        state: GraphState,
+        cluster: MicroCluster,
+        inspect_reason: str,
+    ) -> List[MicroCluster]:
+        normalized_reason = inspect_reason.strip() or "need_more_evidence"
+        previous_reasons = list(cluster.inspect_reasons)
+        additional_evidence = self.clustering_service.sample_additional_evidence(cluster)
+
+        if additional_evidence.get("query_ids"):
+            cluster.add_evidence_round(
+                round_index=len(cluster.evidence_rounds) + 1,
+                mode="inspect",
+                groups=additional_evidence.get("groups", {}),
+                query_ids=additional_evidence.get("query_ids", []),
+            )
+
+        next_inspect_round = cluster.inspect_round + 1
+        should_force_final, stop_reason = self._should_force_final_review(
+            inspect_reason=normalized_reason,
+            previous_reasons=previous_reasons,
+            additional_evidence=additional_evidence,
+            next_inspect_round=next_inspect_round,
+        )
+
+        cluster.inspect_round = next_inspect_round
+        cluster.inspect_reasons.append(normalized_reason)
+        cluster.allow_inspect = not should_force_final
+        cluster.inspect_stop_reason = stop_reason if should_force_final else None
+        cluster.judge = None
+
+        if should_force_final:
+            print(
+                f"   {cluster.id} inspect停止，进入最终裁决: {stop_reason} "
+                f"(novelty={additional_evidence.get('novelty_score', 0.0):.3f}, "
+                f"coverage={additional_evidence.get('coverage_ratio', 0.0):.2%})"
+            )
+        else:
+            print(
+                f"   {cluster.id} 补充证据后继续评审: "
+                f"新增样本={len(additional_evidence.get('query_ids', []))}, "
+                f"novelty={additional_evidence.get('novelty_score', 0.0):.3f}, "
+                f"coverage={additional_evidence.get('coverage_ratio', 0.0):.2%}"
+            )
+
+        return [cluster] + list(state.get("clusters_list", []))
+
+    def _should_force_final_review(
+        self,
+        *,
+        inspect_reason: str,
+        previous_reasons: List[str],
+        additional_evidence: Dict[str, Any],
+        next_inspect_round: int,
+    ) -> Tuple[bool, str]:
+        max_rounds = int(self.inspect_config.get("max_rounds", 4))
+        min_new_samples = int(self.inspect_config.get("min_new_samples", 4))
+        novelty_threshold = float(self.inspect_config.get("novelty_threshold", 0.08))
+        coverage_threshold = float(self.inspect_config.get("coverage_threshold", 0.75))
+
+        new_query_ids = additional_evidence.get("query_ids", [])
+        novelty_score = float(additional_evidence.get("novelty_score", 0.0))
+        coverage_ratio = float(additional_evidence.get("coverage_ratio", 0.0))
+
+        if not new_query_ids:
+            return True, "no_more_unseen_evidence"
+
+        if next_inspect_round >= max_rounds:
+            return True, f"safety_fuse_max_rounds={max_rounds}"
+
+        if len(new_query_ids) < min_new_samples:
+            return True, f"too_few_new_samples={len(new_query_ids)}"
+
+        if novelty_score < novelty_threshold:
+            return True, f"low_novelty={novelty_score:.3f}"
+
+        normalized_reason = self._normalize_reason(inspect_reason)
+        repeated_reason = normalized_reason and normalized_reason in {
+            self._normalize_reason(reason) for reason in previous_reasons
+        }
+        if repeated_reason and coverage_ratio >= coverage_threshold:
+            return True, f"high_coverage_and_repeated_reason={coverage_ratio:.2%}"
+
+        return False, ""
+
+    def _normalize_reason(self, reason: str) -> str:
+        return " ".join(reason.lower().split())
 
     def run(self, initial_queries: List[Query]) -> Dict[str, Any]:
         """运行完整的TDRCluster V2流程"""

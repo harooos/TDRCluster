@@ -72,6 +72,7 @@ class LLMService:
         system_prompt = create_reviewer_system_prompt()
         existing_categories = {cat["id"]: cat for cat in finalized_categories}
         cluster_ids = [cluster_to_review["id"]]
+        allow_inspect = bool(cluster_to_review.get("allow_inspect", True))
 
         last_result = {"valid": False, "error_message": "unknown"}
         for attempt in range(max_retries + 1):
@@ -86,6 +87,7 @@ class LLMService:
                     response,
                     cluster_ids,
                     existing_categories,
+                    allow_inspect=allow_inspect,
                 )
 
                 if validation_result["valid"]:
@@ -114,6 +116,7 @@ class LLMService:
         xml_response: str,
         cluster_ids: List[str],
         existing_categories: Dict[str, Any] = None,
+        allow_inspect: bool = True,
     ) -> Dict[str, Any]:
         """验证LLM返回的XML响应格式和完整性"""
         result = {
@@ -222,6 +225,15 @@ class LLMService:
                     reason_elem = decision_elem.find("reason")
                     if reason_elem is None or not reason_elem.text:
                         result["error_message"] = "split决策缺少reason字段"
+                        return result
+                    decision["reason"] = reason_elem.text.strip()
+                elif action == "inspect":
+                    if not allow_inspect:
+                        result["error_message"] = "当前轮次不允许inspect决策"
+                        return result
+                    reason_elem = decision_elem.find("reason")
+                    if reason_elem is None or not reason_elem.text:
+                        result["error_message"] = "inspect决策缺少reason字段"
                         return result
                     decision["reason"] = reason_elem.text.strip()
                 else:

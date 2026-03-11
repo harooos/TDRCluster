@@ -244,13 +244,21 @@ class ClusteringService:
         for group_name in ordered_group_names:
             sample_texts.extend(groups[group_name])
 
+        selected_query_ids = [queries[index].id for index in selected_indices]
+
         return {
-            "query_ids": [queries[index].id for index in selected_indices],
+            "query_ids": selected_query_ids,
             "sample_texts": sample_texts,
             "groups": {name: values for name, values in groups.items() if values},
             "coverage_ratio": (
                 len(excluded_query_ids) + len(selected_indices)
             ) / max(1, len(queries)),
+            "novelty_score": self._compute_novelty_score(
+                queries=queries,
+                embeddings=embeddings,
+                new_query_ids=selected_query_ids,
+                reference_query_ids=list(excluded_query_ids),
+            ),
         }
 
     def _allocate_sample_budget(self, total_budget: int) -> Dict[str, int]:
@@ -399,6 +407,41 @@ class ClusteringService:
             return np.ones(len(values))
 
         return (values - min_value) / (max_value - min_value)
+
+    def _compute_novelty_score(
+        self,
+        queries: List[Query],
+        embeddings: np.ndarray,
+        new_query_ids: List[str],
+        reference_query_ids: List[str],
+    ) -> float:
+        if not new_query_ids:
+            return 0.0
+        if not reference_query_ids:
+            return 1.0
+
+        id_to_index = {query.id: index for index, query in enumerate(queries)}
+        new_indices = [id_to_index[query_id] for query_id in new_query_ids if query_id in id_to_index]
+        reference_indices = [
+            id_to_index[query_id]
+            for query_id in reference_query_ids
+            if query_id in id_to_index
+        ]
+        if not new_indices:
+            return 0.0
+        if not reference_indices:
+            return 1.0
+
+        new_vectors = self._l2_normalize(embeddings[new_indices])
+        reference_vectors = self._l2_normalize(embeddings[reference_indices])
+        cosine_similarity = np.clip(new_vectors @ reference_vectors.T, -1.0, 1.0)
+        cosine_distance = 1.0 - cosine_similarity
+        return float(np.min(cosine_distance, axis=1).mean())
+
+    def _l2_normalize(self, values: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return values / norms
 
     def _print_cluster_summary(
         self,

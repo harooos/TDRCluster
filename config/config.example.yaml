@@ -26,6 +26,11 @@ system:
 clustering:
   max_split_depth: 4
   max_samples_per_cluster: 16
+  inspect:
+    max_rounds: 4
+    min_new_samples: 4
+    novelty_threshold: 0.08
+    coverage_threshold: 0.75
   min_cluster_size:
     absolute: 10
     ratio: 0.005

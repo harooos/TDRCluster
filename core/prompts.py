@@ -19,6 +19,7 @@ Core principles:
 - Avoid unnecessary fragmentation. Prefer merge when an existing category can absorb the new evidence without becoming vague.
 - Use create only when the cluster expresses a genuinely new reusable intent.
 - Use split only when the cluster still clearly mixes multiple distinct intents and should be sent back for further physical splitting.
+- Use inspect only when one more evidence round is likely to change the decision.
 - The evidence may be grouped into representative, diverse, and boundary samples. Use all groups jointly when judging both purity and category fit.
 - Category names should be concise, domain-faithful, and reusable.
 - If a merge broadens the meaning of an existing category, update the category name only when the current name becomes too narrow or misleading.
@@ -35,15 +36,31 @@ def create_review_prompt(
 
     runtime_config = CONFIG.get("runtime", {})
     taxonomy_context = runtime_config.get("taxonomy_context")
+    allow_inspect = bool(cluster_to_review.get("allow_inspect", True))
 
     context_xml = _create_context_block(taxonomy_context)
     existing_categories_xml = _create_existing_categories_block(finalized_categories)
     cluster_xml = _create_cluster_block(cluster_to_review)
+    review_state_xml = _create_review_state_block(cluster_to_review)
+    action_text = "create, merge, split, or inspect" if allow_inspect else "create, merge, or split"
+    action_schema = "create|merge|split|inspect" if allow_inspect else "create|merge|split"
+    inspect_rule = ""
+    if allow_inspect:
+        inspect_rule = """
+    - inspect:
+      Use only when the currently shown evidence is still insufficient for a reliable create, merge, or split decision,
+      and one more round of evidence is likely to materially change your judgment.
+      You must provide:
+      - reason"""
+    else:
+        inspect_rule = """
+    - inspect:
+      Not allowed in this final review. You must choose create, merge, or split."""
 
     return f"""{context_xml}{existing_categories_xml}
 <task>
   <instruction>
-    Review the single micro-cluster below and choose exactly ONE action: create, merge, or split.
+    Review the single micro-cluster below and choose exactly ONE action: {action_text}.
 
     Decision rules:
     - Read the evidence holistically:
@@ -75,6 +92,7 @@ def create_review_prompt(
       Do not use split merely to chase a finer taxonomy.
       You must provide:
       - reason
+{inspect_rule}
 
     Hard constraints:
     - Review exactly one micro-cluster in this call.
@@ -83,6 +101,7 @@ def create_review_prompt(
     - Do not output noise decisions. Noise is handled by the system.
   </instruction>
 
+  {review_state_xml}
   {cluster_xml}
 </task>
 
@@ -93,7 +112,7 @@ def create_review_prompt(
   <decisions>
     <decision>
       <id>micro-cluster-id</id>
-      <action>create|merge|split</action>
+      <action>{action_schema}</action>
       <!-- CREATE -->
       <name>category name</name>
       <definition>semantic definition</definition>
@@ -103,7 +122,7 @@ def create_review_prompt(
       <name_update>no_update or refined category name</name_update>
       <definition_update>no_update or refined definition</definition_update>
       <boundary_update>no_update or refined boundary notes</boundary_update>
-      <!-- SPLIT -->
+      <!-- SPLIT / INSPECT -->
       <reason>why this cluster still mixes multiple intents</reason>
     </decision>
   </decisions>
@@ -167,6 +186,30 @@ def _create_cluster_block(cluster: Dict[str, Any]) -> str:
 </micro_cluster_to_review>"""
 
 
+def _create_review_state_block(cluster: Dict[str, Any]) -> str:
+    inspect_round = int(cluster.get("inspect_round", 0))
+    allow_inspect = "true" if cluster.get("allow_inspect", True) else "false"
+    lines = [
+        "<review_state>",
+        f"  <inspect_round>{inspect_round}</inspect_round>",
+        f"  <allow_inspect>{allow_inspect}</allow_inspect>",
+    ]
+
+    inspect_reasons = cluster.get("inspect_reasons", [])
+    if inspect_reasons:
+        lines.append("  <inspect_history>")
+        for index, reason in enumerate(inspect_reasons, 1):
+            lines.append(f"    <inspect_request round=\"{index}\">{_xml_text(reason)}</inspect_request>")
+        lines.append("  </inspect_history>")
+
+    inspect_stop_reason = cluster.get("inspect_stop_reason")
+    if inspect_stop_reason:
+        lines.append(f"  <inspect_stop_reason>{_xml_text(inspect_stop_reason)}</inspect_stop_reason>")
+
+    lines.append("</review_state>")
+    return "\n".join(lines)
+
+
 def _create_evidence_rounds_block(evidence_rounds: List[Dict[str, Any]]) -> str:
     if not evidence_rounds:
         return "  <evidence_rounds>\n    <evidence_round mode=\"initial\" round=\"1\">\n      <note>none</note>\n    </evidence_round>\n  </evidence_rounds>"
@@ -213,4 +256,8 @@ def create_cluster_display_dict(cluster: MicroCluster) -> Dict[str, Any]:
         "query_count": len(cluster.queries),
         "sample_texts": cluster.sample_texts,
         "evidence_rounds": cluster.evidence_rounds,
+        "inspect_round": cluster.inspect_round,
+        "inspect_reasons": cluster.inspect_reasons,
+        "allow_inspect": cluster.allow_inspect,
+        "inspect_stop_reason": cluster.inspect_stop_reason,
     }
