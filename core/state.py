@@ -8,6 +8,20 @@ def _task_id() -> str:
     return f"task-{uuid.uuid4().hex[:8]}"
 
 
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    deduped = []
+    seen = set()
+
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+
+    return deduped
+
+
 class Query(BaseModel):
     """单个查询对象，包含内容和向量表示"""
     id: str
@@ -41,6 +55,10 @@ class MicroCluster(BaseModel):
     depth: int = 0
     queries: List[Query]
     sample_texts: List[str] = Field(default_factory=list)
+    sample_query_ids: List[str] = Field(default_factory=list)
+    evidence_rounds: List[Dict[str, Any]] = Field(default_factory=list)
+    inspect_round: int = 0
+    inspect_reasons: List[str] = Field(default_factory=list)
     is_noise: bool = False
     judge: Optional[Dict[str, Any]] = None
 
@@ -57,6 +75,53 @@ class MicroCluster(BaseModel):
     @property
     def samples(self) -> List[str]:
         return self.sample_texts
+
+    @property
+    def positive_seed_texts(self) -> List[str]:
+        preferred_labels = ("representative", "diverse", "additional")
+        collected = []
+
+        for evidence_round in self.evidence_rounds:
+            groups = evidence_round.get("groups", {})
+            for label in preferred_labels:
+                collected.extend(groups.get(label, []))
+
+        if collected:
+            return _dedupe_preserve_order(collected)
+        return self.sample_texts
+
+    def add_evidence_round(
+        self,
+        *,
+        round_index: int,
+        mode: str,
+        groups: Dict[str, List[str]],
+        query_ids: List[str],
+    ):
+        ordered_groups = {
+            label: _dedupe_preserve_order(texts)
+            for label, texts in groups.items()
+            if texts
+        }
+
+        ordered_texts = []
+        for label in ("representative", "diverse", "boundary", "additional"):
+            ordered_texts.extend(ordered_groups.get(label, []))
+
+        for label, texts in ordered_groups.items():
+            if label not in {"representative", "diverse", "boundary", "additional"}:
+                ordered_texts.extend(texts)
+
+        self.evidence_rounds.append(
+            {
+                "round": round_index,
+                "mode": mode,
+                "groups": ordered_groups,
+                "sample_count": len(query_ids),
+            }
+        )
+        self.sample_query_ids = _dedupe_preserve_order(self.sample_query_ids + query_ids)
+        self.sample_texts = _dedupe_preserve_order(self.sample_texts + ordered_texts)
 
 
 class Category(BaseModel):

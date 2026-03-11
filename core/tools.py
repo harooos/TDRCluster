@@ -10,7 +10,7 @@ from .state import GraphState, Category, SplitTask, MicroCluster
 
 
 def _max_examples() -> int:
-    return CONFIG.get("clustering", {}).get("max_samples_per_cluster", 8)
+    return CONFIG.get("clustering", {}).get("max_samples_per_cluster", 16)
 
 
 def _merge_examples(existing_examples: List[str], new_examples: List[str]) -> List[str]:
@@ -36,7 +36,7 @@ def create_new_category_tool(state: GraphState, cluster: MicroCluster, decision:
         name=decision["name"],
         definition=decision["definition"],
         boundary_notes=decision.get("boundary_notes", ""),
-        positive_examples=_merge_examples([], cluster.sample_texts),
+        positive_examples=_merge_examples([], cluster.positive_seed_texts),
         queries=list(cluster.queries),
     )
 
@@ -62,7 +62,7 @@ def merge_into_existing_category_tool(
     existing_category.queries.extend(cluster.queries)
     existing_category.positive_examples = _merge_examples(
         existing_category.positive_examples,
-        cluster.sample_texts,
+        cluster.positive_seed_texts,
     )
 
     if name_update != "no_update":

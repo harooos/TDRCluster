@@ -25,7 +25,7 @@ system:
 
 clustering:
   max_split_depth: 4
-  max_samples_per_cluster: 8
+  max_samples_per_cluster: 16
   min_cluster_size:
     absolute: 10
     ratio: 0.005

@@ -84,6 +84,7 @@ def save_results(final_state: dict, output_dir: str, dataset_name: str) -> tuple
             "depth": cluster.depth,
             "is_noise": cluster.is_noise,
             "sample_texts": cluster.sample_texts[:5],
+            "evidence_rounds": cluster.evidence_rounds,
             "reason": (cluster.judge or {}).get("residual_reason", "unspecified"),
         }
 

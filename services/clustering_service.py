@@ -1,9 +1,10 @@
 """
 物理切分服务
 """
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Optional
 
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
 from config.config_loader import CONFIG
@@ -49,7 +50,6 @@ class ClusteringService:
             dense_cluster = self._build_cluster(
                 task=task,
                 queries=queries,
-                embeddings=np.array([q.embedding for q in queries]),
                 is_noise=False,
             )
             print(f"查询量较小，直接作为单一micro-cluster输出: {dense_cluster.id}")
@@ -74,7 +74,6 @@ class ClusteringService:
             fallback_cluster = self._build_cluster(
                 task=task,
                 queries=queries,
-                embeddings=reduced_embeddings,
                 is_noise=False,
             )
             print(f"HDBSCAN未找到稳定稠密簇，回退为单一micro-cluster: {fallback_cluster.id}")
@@ -82,11 +81,9 @@ class ClusteringService:
 
         for label, indices in sorted(label_to_indices.items(), key=lambda item: item[0]):
             cluster_queries = [queries[idx] for idx in indices]
-            cluster_embeddings = reduced_embeddings[indices]
             cluster = self._build_cluster(
                 task=task,
                 queries=cluster_queries,
-                embeddings=cluster_embeddings,
                 is_noise=(label == -1),
             )
 
@@ -140,39 +137,268 @@ class ClusteringService:
         self,
         task: SplitTask,
         queries: List[Query],
-        embeddings: np.ndarray,
         is_noise: bool,
     ) -> MicroCluster:
         cluster_id = self._generate_cluster_id()
-        sample_texts = self._extract_representative_samples(queries, embeddings)
-        return MicroCluster(
+        cluster = MicroCluster(
             id=cluster_id,
             parent_task_id=task.id,
             parent_cluster_id=task.parent_cluster_id,
             depth=task.depth,
             queries=queries,
-            sample_texts=sample_texts,
             is_noise=is_noise,
             judge=None,
         )
+        initial_evidence = self._build_evidence_package(
+            queries=queries,
+            sample_budget=self.config.get("max_samples_per_cluster", 16),
+        )
+        cluster.add_evidence_round(
+            round_index=1,
+            mode="initial",
+            groups=initial_evidence["groups"],
+            query_ids=initial_evidence["query_ids"],
+        )
+        return cluster
 
     def _generate_cluster_id(self) -> str:
         self.cluster_counter += 1
         return f"mc-{self.cluster_counter:04d}"
 
-    def _extract_representative_samples(
+    def sample_additional_evidence(
+        self,
+        cluster: MicroCluster,
+        sample_budget: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._build_evidence_package(
+            queries=cluster.queries,
+            sample_budget=sample_budget or self.config.get("max_samples_per_cluster", 16),
+            excluded_query_ids=set(cluster.sample_query_ids),
+        )
+
+    def _build_evidence_package(
         self,
         queries: List[Query],
+        sample_budget: int,
+        excluded_query_ids: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        excluded_query_ids = excluded_query_ids or set()
+        candidate_indices = [
+            index for index, query in enumerate(queries)
+            if query.id not in excluded_query_ids
+        ]
+        if not candidate_indices or sample_budget <= 0:
+            return {
+                "query_ids": [],
+                "sample_texts": [],
+                "groups": {},
+                "coverage_ratio": len(excluded_query_ids) / max(1, len(queries)),
+            }
+
+        total_budget = min(sample_budget, len(candidate_indices))
+        budget = self._allocate_sample_budget(total_budget)
+        embeddings = np.array([query.embedding for query in queries], dtype=float)
+
+        representative = self._select_representative_indices(
+            embeddings,
+            candidate_indices,
+            budget["representative"],
+        )
+        remaining = self._remaining_indices(candidate_indices, representative)
+
+        diverse = self._select_diverse_indices(
+            embeddings,
+            remaining,
+            budget["diverse"],
+            anchor_indices=representative,
+        )
+        remaining = self._remaining_indices(remaining, diverse)
+
+        boundary = self._select_boundary_indices(
+            embeddings,
+            remaining,
+            budget["boundary"],
+        )
+        remaining = self._remaining_indices(remaining, boundary)
+
+        selected_indices = representative + diverse + boundary
+        additional = []
+        if len(selected_indices) < total_budget:
+            additional = self._select_fill_indices(
+                embeddings,
+                remaining,
+                total_budget - len(selected_indices),
+                anchor_indices=selected_indices or representative,
+            )
+            selected_indices.extend(additional)
+
+        groups = {
+            "representative": [queries[index].content for index in representative],
+            "diverse": [queries[index].content for index in diverse],
+            "boundary": [queries[index].content for index in boundary],
+            "additional": [queries[index].content for index in additional],
+        }
+
+        ordered_group_names = ("representative", "diverse", "boundary", "additional")
+        sample_texts = []
+        for group_name in ordered_group_names:
+            sample_texts.extend(groups[group_name])
+
+        return {
+            "query_ids": [queries[index].id for index in selected_indices],
+            "sample_texts": sample_texts,
+            "groups": {name: values for name, values in groups.items() if values},
+            "coverage_ratio": (
+                len(excluded_query_ids) + len(selected_indices)
+            ) / max(1, len(queries)),
+        }
+
+    def _allocate_sample_budget(self, total_budget: int) -> Dict[str, int]:
+        if total_budget <= 0:
+            return {"representative": 0, "diverse": 0, "boundary": 0}
+        if total_budget == 1:
+            return {"representative": 1, "diverse": 0, "boundary": 0}
+        if total_budget == 2:
+            return {"representative": 1, "diverse": 1, "boundary": 0}
+        if total_budget == 3:
+            return {"representative": 1, "diverse": 1, "boundary": 1}
+
+        representative = max(1, round(total_budget * 0.375))
+        diverse = max(1, round(total_budget * 0.375))
+        boundary = max(1, total_budget - representative - diverse)
+
+        while representative + diverse + boundary > total_budget:
+            if representative >= diverse and representative >= boundary and representative > 1:
+                representative -= 1
+            elif diverse >= boundary and diverse > 1:
+                diverse -= 1
+            elif boundary > 1:
+                boundary -= 1
+            else:
+                break
+
+        while representative + diverse + boundary < total_budget:
+            if representative <= diverse:
+                representative += 1
+            else:
+                diverse += 1
+
+        return {
+            "representative": representative,
+            "diverse": diverse,
+            "boundary": boundary,
+        }
+
+    def _select_representative_indices(
+        self,
         embeddings: np.ndarray,
-    ) -> List[str]:
-        max_samples = self.config.get("max_samples_per_cluster", 8)
-        if len(queries) <= max_samples:
-            return [query.content for query in queries]
+        candidate_indices: List[int],
+        count: int,
+    ) -> List[int]:
+        if count <= 0 or not candidate_indices:
+            return []
+
+        centroid = embeddings[candidate_indices].mean(axis=0)
+        distances = np.linalg.norm(embeddings[candidate_indices] - centroid, axis=1)
+        ranked = np.array(candidate_indices)[np.argsort(distances)]
+        return ranked[:count].tolist()
+
+    def _select_diverse_indices(
+        self,
+        embeddings: np.ndarray,
+        candidate_indices: List[int],
+        count: int,
+        anchor_indices: Optional[List[int]] = None,
+    ) -> List[int]:
+        if count <= 0 or not candidate_indices:
+            return []
+
+        selected = []
+        remaining = list(candidate_indices)
+        anchor_indices = list(anchor_indices or [])
+
+        if anchor_indices:
+            reference_vectors = embeddings[anchor_indices]
+        else:
+            centroid = embeddings[remaining].mean(axis=0)
+            first_index = remaining[int(np.argmax(np.linalg.norm(embeddings[remaining] - centroid, axis=1)))]
+            selected.append(first_index)
+            remaining.remove(first_index)
+            reference_vectors = embeddings[[first_index]]
+
+        while remaining and len(selected) < count:
+            distances = [
+                (
+                    index,
+                    float(np.min(np.linalg.norm(reference_vectors - embeddings[index], axis=1))),
+                )
+                for index in remaining
+            ]
+            next_index = max(distances, key=lambda item: item[1])[0]
+            selected.append(next_index)
+            remaining.remove(next_index)
+            reference_vectors = np.vstack([reference_vectors, embeddings[next_index]])
+
+        return selected
+
+    def _select_boundary_indices(
+        self,
+        embeddings: np.ndarray,
+        candidate_indices: List[int],
+        count: int,
+    ) -> List[int]:
+        if count <= 0 or not candidate_indices:
+            return []
 
         centroid = embeddings.mean(axis=0)
-        distances = np.linalg.norm(embeddings - centroid, axis=1)
-        representative_indices = np.argsort(distances)[:max_samples]
-        return [queries[index].content for index in representative_indices]
+        centroid_distances = np.linalg.norm(embeddings[candidate_indices] - centroid, axis=1)
+        all_local_sparsity = self._compute_local_sparsity(embeddings)
+        local_sparsity = all_local_sparsity[candidate_indices]
+        combined_score = self._normalize_scores(centroid_distances) + self._normalize_scores(local_sparsity)
+        ranked = np.array(candidate_indices)[np.argsort(-combined_score)]
+        return ranked[:count].tolist()
+
+    def _select_fill_indices(
+        self,
+        embeddings: np.ndarray,
+        candidate_indices: List[int],
+        count: int,
+        anchor_indices: Optional[List[int]] = None,
+    ) -> List[int]:
+        return self._select_diverse_indices(
+            embeddings=embeddings,
+            candidate_indices=candidate_indices,
+            count=count,
+            anchor_indices=anchor_indices,
+        )
+
+    def _remaining_indices(self, original: List[int], selected: List[int]) -> List[int]:
+        selected_set = set(selected)
+        return [index for index in original if index not in selected_set]
+
+    def _compute_local_sparsity(self, embeddings: np.ndarray) -> np.ndarray:
+        if len(embeddings) <= 2:
+            return np.ones(len(embeddings))
+
+        neighbor_count = min(max(2, int(np.sqrt(len(embeddings)))), len(embeddings) - 1)
+        model = NearestNeighbors(
+            n_neighbors=neighbor_count + 1,
+            metric="cosine",
+        )
+        model.fit(embeddings)
+        distances, _ = model.kneighbors(embeddings)
+        return distances[:, 1:].mean(axis=1)
+
+    def _normalize_scores(self, values: np.ndarray) -> np.ndarray:
+        if len(values) == 0:
+            return values
+
+        min_value = float(np.min(values))
+        max_value = float(np.max(values))
+        if np.isclose(min_value, max_value):
+            return np.ones(len(values))
+
+        return (values - min_value) / (max_value - min_value)
 
     def _print_cluster_summary(
         self,
