@@ -1,135 +1,172 @@
 # TDRCluster
 
-**LLM驱动的动态意图聚类系统**
+Dynamic intent taxonomy induction for unlabeled queries.
 
-一个面向无标签用户查询的动态意图聚类系统。当前版本采用单一 BFS 队列状态机，将“物理切分”和“语义收敛”拆分给不同引擎：`UMAP + HDBSCAN` 负责物理提纯，LLM 负责维护 running taxonomy。
+TDRCluster 是一个面向无标签文本数据的意图发现项目。它的目标不是把数据强行压进预先设定好的类别数，而是从原始 query 中逐步形成一套稳定、可复用、可解释的 taxonomy。
 
-## 🌟 核心特性
+项目当前采用三段式流程：
 
-- **🧠 双引擎架构**: `UMAP + HDBSCAN` 负责物理切分，LLM 负责语义裁决
-- **🔄 BFS 状态机**: 采用统一队列循环，持续处理 root task 与后续 resplit task
-- **🎯 Taxonomy维护**: 支持 `create / merge / split` 三种核心语义动作，`merge` 可按需更新已有类别的名称、定义和边界
-- **🏷️ 结构化类别**: 类别包含 `name / definition / boundary_notes / positive_examples`
-- **🧹 残差池**: 显式记录噪声簇与无法继续稳定切分的残差簇
-- **📊 多数据集**: 支持banking77等标准数据集，也支持自定义CSV数据
-- **🔧 多provider**: 支持各种LLM服务提供商
+- 用 `Embedding + UMAP + HDBSCAN` 完成物理切分与去噪
+- 用 LLM 顺序维护 running taxonomy
+- 在叶子 taxonomy 收敛后，再生成独立的层级浏览树
 
-## 🚀 快速开始
+这套设计适合客服日志、搜索 query、工单、对话记录等场景，尤其适合“类别尚未定义清楚，但希望先看到真实意图结构”的任务。
 
-### 环境要求
+## Overview
 
-- Python 3.9+
-- 至少4GB内存  
-- 网络连接（用于LLM API调用）
+传统聚类方案通常会遇到几个问题：需要预先指定类别数、容易被噪声拖偏、以及在大簇上直接让模型判断时缺乏足够证据。TDRCluster 的思路是先把几何问题和语义问题拆开，再让 taxonomy 在流程中逐步收敛。
 
-### 安装
+在当前版本中：
+
+- 物理切分负责把大规模原始数据分解为纯度更高的 micro-clusters
+- LLM 只负责语义裁决，而不负责猜测聚类参数
+- hierarchy 被放在后处理阶段，不会反向影响叶子分类结果
+
+## Highlights
+
+- No predefined category count
+  类别数量和粒度不需要预先指定，由数据分布与语义收敛过程自然形成。
+
+- Running taxonomy
+  系统不是一次性生成全部标签，而是在处理过程中持续维护已有类别，并对新证据做 `create / merge / split / inspect` 决策。
+
+- Noise-aware physical split
+  噪声点和不稳定簇会被显式剥离，避免在早期就污染 taxonomy。
+
+- Evidence-driven review
+  Reviewer 看到的不是单一中心样本，而是混合采样后的代表样本、差异样本和边界样本。
+
+- Post-hoc hierarchy
+  最终层级树是独立生成的浏览结构，不改动叶子 taxonomy。
+
+## Example: banking77
+
+下面这张图来自当前仓库内保留的一次 `banking77` 完整运行结果。它同时展示了最终 flat taxonomy 的规模，以及 post-hoc hierarchy 的顶层结构。
+
+![banking77 example](docs/assets/banking77_example.svg)
+
+这一版结果中：
+
+- 形成了 55 个叶子类别
+- 后处理层级树包含 5 个顶层语义组，最大深度为 3
+- `NMI_classified = 0.8923`
+- `NMI_full = 0.8650`
+
+## How It Works
+
+### 1. Physical partitioning
+
+系统先为原始 query 生成 embedding，再通过 `UMAP + HDBSCAN` 将数据切分为多个 micro-clusters。目标不是直接给出最终标签，而是生成一批更适合语义审查的高纯度候选簇。
+
+### 2. Semantic convergence
+
+每个 micro-cluster 会被按顺序送入 reviewer。LLM 基于当前 running taxonomy 做出以下决策之一：
+
+- `create`
+- `merge`
+- `split`
+- `inspect`
+
+其中 `inspect` 用于请求额外证据。当当前样本不足以可靠判断时，系统会继续补充一轮未见样本，再进入下一次审查。
+
+### 3. Hierarchy building
+
+当 flat leaf taxonomy 已经形成后，可以再调用 hierarchy builder，把已有叶子类组织成一棵更适合浏览的语义树。这个阶段不会重命名、拆分、合并或删除任何叶子类别。
+
+## Design Principles
+
+- Leaf taxonomy is the source of truth
+- Hierarchy is a view, not a rewrite
+- Physical split and semantic judgment should be separated
+- Merge should be allowed to refine category boundaries
+
+这几条原则基本定义了当前版本的边界。
+
+## Quick Start
 
 ```bash
-git clone https://github.com/your-repo/TDRCluster
+git clone https://github.com/harooos/TDRCluster.git
 cd TDRCluster
 pip install -r requirements.txt
+cp config/config.example.yaml config/config.yaml
 ```
 
-### 配置
+然后：
 
-复制 `config/config.example.yaml` 为本地 `config/config.yaml` 后再编辑：
-
-```yaml
-runtime:
-  dataset: "banking77"
-  taxonomy_context: null  # 可选：补充领域背景或命名偏好
-
-# LLM配置
-llm:
-  base_url: "your-llm-api-base-url" 
-  api_key: "your-llm-api-key"
-  model_name: "your-model-name"
-
-# Embedding配置  
-embedding:
-  base_url: "your-embedding-api-base-url"
-  api_key: "your-embedding-api-key"
-  model_name: "your-embedding-model"
-```
-
-`taxonomy_context` 是可选的。如果不填，reviewer 只依据已有 taxonomy 和当前 micro-cluster 样本做判断。
-
-### 运行
+1. 在 `config/config.yaml` 中填写 LLM 与 embedding 配置
+2. 将原始数据放入 `data/raw_data/`
+3. 支持 `CSV` 和 `Excel` 输入，文件至少包含 `query` 列
+4. 运行主流程
 
 ```bash
 python main.py
 ```
 
-当前版本通过 `config/config.yaml` 控制运行数据集、采样规模与物理切分参数。
+如果需要层级化结果：
 
-## 📁 项目结构
-
-```
-TDRCluster/
-├── main.py                    # 主程序入口
-├── config/
-│   ├── config.yaml           # 配置文件
-│   └── config_loader.py      # 配置加载器
-├── core/                     # 核心模块
-│   ├── state.py              # 数据结构定义  
-│   ├── tools.py              # 工具函数
-│   ├── prompts.py            # LLM提示模板
-│   └── graph.py              # LangGraph工作流
-├── services/                 # 服务层
-│   ├── llm_service.py        # LLM服务
-│   ├── embedding_service.py  # 向量化服务
-│   ├── clustering_service.py # 聚类服务
-│   └── dataset_manager.py    # 数据集管理
-├── data/                     # 数据存储
-│   ├── raw_data/             # 原始CSV数据
-│   └── processed_data/       # 处理后的数据和embedding
-└── output/                   # 聚类结果输出
+```bash
+python build_hierarchy.py output/<summary_json>
 ```
 
-## ⚙️ 工作流程
+## Outputs
 
-1. **数据准备**: 加载 CSV，并为 query 生成或读取 embedding
-2. **Root Task 入队**: 将全量 query 作为未分化大簇放入 BFS 队列
-3. **物理切分**: 使用 `UMAP + HDBSCAN` 生成 micro-clusters 与 residual clusters
-4. **LLM 审查**: 结合 running taxonomy 对每个 micro-cluster 做 `create / merge / split`
-5. **动态收敛**: 更新 taxonomy，或把仍不纯的 cluster 重新入队继续切分
-6. **结果输出**: 导出分类结果与 residual pool 摘要
+主流程通常会生成：
 
-## 🔧 自定义数据集
+- `output/<dataset>_clustering_<timestamp>.csv`
+- `output/<dataset>_summary_<timestamp>.json`
 
-只需要包含 `query` 列的CSV文件：
+层级化流程会额外生成：
 
-```csv
-query
-"I need to reset my account password"
-"How can I change the shipping address for my order?"
-"The app crashes when I try to upload a file"
-```
+- `output/<dataset>_hierarchy_<timestamp>.json`
 
-将文件放入 `data/raw_data/` 目录，系统会自动处理。
+其中：
 
-## 📊 输出结果
+- `clustering.csv` 记录 query 到叶子类别的映射
+- `summary.json` 记录最终 flat taxonomy 与 residual 信息
+- `hierarchy.json` 记录 post-hoc 生成的层级树
 
-- **详细结果**: `output/dataset_clustering_timestamp.csv`
-- **摘要报告**: `output/dataset_summary_timestamp.json`
+原始输入可以是：
 
-摘要报告会同时包含：
+- `data/raw_data/<dataset>.csv`
+- `data/raw_data/<dataset>.xlsx`
+- `data/raw_data/<dataset>.xlsm`
+- `data/raw_data/<dataset>.xls`
 
-- 最终 taxonomy 的结构化类别信息
-- residual cluster 的数量、样本与残差原因
+## Configuration
 
-## 🤝 贡献
+仓库跟踪的配置模板为：
 
-1. Fork 项目
-2. 创建功能分支
-3. 提交更改
-4. 推送到分支  
-5. 创建 Pull Request
+- `config/config.example.yaml`
 
-## 📄 许可证
+本地运行时使用：
 
-MIT License - 查看 [LICENSE](LICENSE) 文件了解详情。
+- `config/config.yaml`
 
----
+当前实现支持：
 
-**让AI理解你的用户意图** 🚀
+- OpenAI-compatible LLM endpoint
+- `openai` 或 `ark_multimodal` 风格的 embedding 接口
+
+## Benchmark Snapshot
+
+当前版本在 `banking77` 上的一次完整运行结果中，得到：
+
+- `NMI_classified = 0.8923`
+- `NMI_full = 0.8650`
+
+仓库目录中保留了一版对应输出：
+
+- `output/banking77_summary_20260311_230022.json`
+- `output/banking77_hierarchy_20260312_000101.json`
+
+## Use Cases
+
+TDRCluster 适合以下场景：
+
+- 客服意图发现
+- 搜索 query 聚类
+- 工单主题归纳
+- 对话日志中的用户需求结构分析
+- 标注体系建立前的探索性 taxonomy induction
+
+如果你的目标是从无标签 query 中得到一套尽量稳定、可解释、可扩展的类别结构，而不是只跑一次静态聚类，这个项目就是为此设计的。
