@@ -27,10 +27,11 @@ clustering:
   max_split_depth: 4
   max_samples_per_cluster: 16
   inspect:
+    sample_budget: 16
     max_rounds: 4
-    min_new_samples: 4
-    novelty_threshold: 0.08
-    coverage_threshold: 0.75
+    min_novelty_ratio: 0.25
+    force_decision_coverage: 0.85
+    max_same_reason_repeats: 2
   min_cluster_size:
     absolute: 10
     ratio: 0.005

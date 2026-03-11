@@ -2,6 +2,7 @@
 LangGraph流程编排模块
 实现TDRCluster V2的完整工作流：splitter -> reviewer -> dispatcher
 """
+import re
 from typing import List, Dict, Any, Tuple
 from collections import deque
 
@@ -264,14 +265,16 @@ class TDRClusterGraph:
         if should_force_final:
             print(
                 f"   {cluster.id} inspect停止，进入最终裁决: {stop_reason} "
-                f"(novelty={additional_evidence.get('novelty_score', 0.0):.3f}, "
+                f"(novelty_ratio={additional_evidence.get('novelty_ratio', 0.0):.2f}, "
+                f"relative_novelty={additional_evidence.get('relative_novelty', 0.0):.2f}, "
                 f"coverage={additional_evidence.get('coverage_ratio', 0.0):.2%})"
             )
         else:
             print(
                 f"   {cluster.id} 补充证据后继续评审: "
                 f"新增样本={len(additional_evidence.get('query_ids', []))}, "
-                f"novelty={additional_evidence.get('novelty_score', 0.0):.3f}, "
+                f"novelty_ratio={additional_evidence.get('novelty_ratio', 0.0):.2f}, "
+                f"relative_novelty={additional_evidence.get('relative_novelty', 0.0):.2f}, "
                 f"coverage={additional_evidence.get('coverage_ratio', 0.0):.2%}"
             )
 
@@ -286,37 +289,48 @@ class TDRClusterGraph:
         next_inspect_round: int,
     ) -> Tuple[bool, str]:
         max_rounds = int(self.inspect_config.get("max_rounds", 4))
-        min_new_samples = int(self.inspect_config.get("min_new_samples", 4))
-        novelty_threshold = float(self.inspect_config.get("novelty_threshold", 0.08))
-        coverage_threshold = float(self.inspect_config.get("coverage_threshold", 0.75))
+        min_novelty_ratio = float(self.inspect_config.get("min_novelty_ratio", 0.25))
+        coverage_threshold = float(self.inspect_config.get("force_decision_coverage", 0.85))
+        max_same_reason_repeats = int(self.inspect_config.get("max_same_reason_repeats", 2))
 
         new_query_ids = additional_evidence.get("query_ids", [])
-        novelty_score = float(additional_evidence.get("novelty_score", 0.0))
+        novelty_ratio = float(additional_evidence.get("novelty_ratio", 0.0))
+        relative_novelty = float(additional_evidence.get("relative_novelty", 0.0))
         coverage_ratio = float(additional_evidence.get("coverage_ratio", 0.0))
 
         if not new_query_ids:
             return True, "no_more_unseen_evidence"
 
-        if next_inspect_round >= max_rounds:
+        if next_inspect_round > max_rounds:
             return True, f"safety_fuse_max_rounds={max_rounds}"
 
-        if len(new_query_ids) < min_new_samples:
-            return True, f"too_few_new_samples={len(new_query_ids)}"
+        if novelty_ratio < min_novelty_ratio:
+            return True, f"low_novelty_ratio={novelty_ratio:.2f}"
 
-        if novelty_score < novelty_threshold:
-            return True, f"low_novelty={novelty_score:.3f}"
+        if coverage_ratio >= coverage_threshold:
+            return True, f"high_coverage={coverage_ratio:.2%}"
 
         normalized_reason = self._normalize_reason(inspect_reason)
-        repeated_reason = normalized_reason and normalized_reason in {
-            self._normalize_reason(reason) for reason in previous_reasons
-        }
-        if repeated_reason and coverage_ratio >= coverage_threshold:
-            return True, f"high_coverage_and_repeated_reason={coverage_ratio:.2%}"
+        repeated_reason_count = 1 + sum(
+            1
+            for reason in previous_reasons
+            if self._normalize_reason(reason) == normalized_reason
+        )
+        if (
+            normalized_reason
+            and repeated_reason_count >= max_same_reason_repeats
+            and novelty_ratio < 0.5
+        ):
+            return True, (
+                "repeated_reason_without_new_signal="
+                f"{repeated_reason_count}:{novelty_ratio:.2f}:{relative_novelty:.2f}"
+            )
 
         return False, ""
 
     def _normalize_reason(self, reason: str) -> str:
-        return " ".join(reason.lower().split())
+        normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", reason.lower())
+        return " ".join(normalized.split())
 
     def run(self, initial_queries: List[Query]) -> Dict[str, Any]:
         """运行完整的TDRCluster V2流程"""

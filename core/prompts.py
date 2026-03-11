@@ -44,6 +44,7 @@ def create_review_prompt(
     review_state_xml = _create_review_state_block(cluster_to_review)
     action_text = "create, merge, split, or inspect" if allow_inspect else "create, merge, or split"
     action_schema = "create|merge|split|inspect" if allow_inspect else "create|merge|split"
+    final_review_note = ""
     inspect_rule = ""
     if allow_inspect:
         inspect_rule = """
@@ -53,6 +54,10 @@ def create_review_prompt(
       You must provide:
       - reason"""
     else:
+        final_review_note = """
+    - This is a forced final review.
+      The system determined that more evidence rounds are unlikely to add meaningful new information.
+      You must make the best final decision from the evidence already shown."""
         inspect_rule = """
     - inspect:
       Not allowed in this final review. You must choose create, merge, or split."""
@@ -67,6 +72,7 @@ def create_review_prompt(
       representative samples show the semantic center,
       diverse samples show major internal variation,
       boundary samples show hard-edge or suspicious cases most likely to reveal impurity.
+{final_review_note}
 
     - create:
       Use when this micro-cluster expresses a new intent that is not covered by the current taxonomy.

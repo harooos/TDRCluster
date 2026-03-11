@@ -170,10 +170,13 @@ class ClusteringService:
         cluster: MicroCluster,
         sample_budget: Optional[int] = None,
     ) -> Dict[str, Any]:
+        inspect_config = self.config.get("inspect", {})
         return self._build_evidence_package(
             queries=cluster.queries,
-            sample_budget=sample_budget or self.config.get("max_samples_per_cluster", 16),
+            sample_budget=sample_budget or inspect_config.get("sample_budget", self.config.get("max_samples_per_cluster", 16)),
             excluded_query_ids=set(cluster.sample_query_ids),
+            mode="inspect",
+            anchor_query_ids=cluster.sample_query_ids,
         )
 
     def _build_evidence_package(
@@ -181,6 +184,8 @@ class ClusteringService:
         queries: List[Query],
         sample_budget: int,
         excluded_query_ids: Optional[set[str]] = None,
+        mode: str = "initial",
+        anchor_query_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         excluded_query_ids = excluded_query_ids or set()
         candidate_indices = [
@@ -193,11 +198,67 @@ class ClusteringService:
                 "sample_texts": [],
                 "groups": {},
                 "coverage_ratio": len(excluded_query_ids) / max(1, len(queries)),
+                "novelty_score": 0.0,
+                "relative_novelty": 0.0,
+                "novelty_ratio": 0.0,
             }
 
         total_budget = min(sample_budget, len(candidate_indices))
-        budget = self._allocate_sample_budget(total_budget)
         embeddings = np.array([query.embedding for query in queries], dtype=float)
+        anchor_query_id_set = set(anchor_query_ids or [])
+        anchor_indices = [
+            index
+            for index, query in enumerate(queries)
+            if query.id in anchor_query_id_set
+        ]
+
+        if mode == "inspect":
+            groups, selected_indices = self._build_inspect_groups(
+                queries=queries,
+                embeddings=embeddings,
+                candidate_indices=candidate_indices,
+                anchor_indices=anchor_indices,
+                total_budget=total_budget,
+            )
+        else:
+            groups, selected_indices = self._build_initial_groups(
+                queries=queries,
+                embeddings=embeddings,
+                candidate_indices=candidate_indices,
+                total_budget=total_budget,
+            )
+
+        ordered_group_names = ("representative", "diverse", "boundary", "additional")
+        sample_texts = []
+        for group_name in ordered_group_names:
+            sample_texts.extend(groups.get(group_name, []))
+
+        selected_query_ids = [queries[index].id for index in selected_indices]
+        novelty_metrics = self._compute_novelty_metrics(
+            queries=queries,
+            embeddings=embeddings,
+            new_query_ids=selected_query_ids,
+            reference_query_ids=list(excluded_query_ids),
+        )
+
+        return {
+            "query_ids": selected_query_ids,
+            "sample_texts": sample_texts,
+            "groups": {name: values for name, values in groups.items() if values},
+            "coverage_ratio": (
+                len(excluded_query_ids) + len(selected_indices)
+            ) / max(1, len(queries)),
+            **novelty_metrics,
+        }
+
+    def _build_initial_groups(
+        self,
+        queries: List[Query],
+        embeddings: np.ndarray,
+        candidate_indices: List[int],
+        total_budget: int,
+    ) -> tuple[Dict[str, List[str]], List[int]]:
+        budget = self._allocate_sample_budget(total_budget)
 
         representative = self._select_representative_indices(
             embeddings,
@@ -238,28 +299,50 @@ class ClusteringService:
             "boundary": [queries[index].content for index in boundary],
             "additional": [queries[index].content for index in additional],
         }
+        return groups, selected_indices
 
-        ordered_group_names = ("representative", "diverse", "boundary", "additional")
-        sample_texts = []
-        for group_name in ordered_group_names:
-            sample_texts.extend(groups[group_name])
+    def _build_inspect_groups(
+        self,
+        queries: List[Query],
+        embeddings: np.ndarray,
+        candidate_indices: List[int],
+        anchor_indices: List[int],
+        total_budget: int,
+    ) -> tuple[Dict[str, List[str]], List[int]]:
+        budget = self._allocate_inspect_budget(total_budget)
 
-        selected_query_ids = [queries[index].id for index in selected_indices]
+        diverse = self._select_diverse_indices(
+            embeddings,
+            candidate_indices,
+            budget["diverse"],
+            anchor_indices=anchor_indices,
+        )
+        remaining = self._remaining_indices(candidate_indices, diverse)
 
-        return {
-            "query_ids": selected_query_ids,
-            "sample_texts": sample_texts,
-            "groups": {name: values for name, values in groups.items() if values},
-            "coverage_ratio": (
-                len(excluded_query_ids) + len(selected_indices)
-            ) / max(1, len(queries)),
-            "novelty_score": self._compute_novelty_score(
-                queries=queries,
-                embeddings=embeddings,
-                new_query_ids=selected_query_ids,
-                reference_query_ids=list(excluded_query_ids),
-            ),
+        boundary = self._select_boundary_indices(
+            embeddings,
+            remaining,
+            budget["boundary"],
+        )
+        remaining = self._remaining_indices(remaining, boundary)
+
+        selected_indices = diverse + boundary
+        additional = []
+        if len(selected_indices) < total_budget:
+            additional = self._select_fill_indices(
+                embeddings,
+                remaining,
+                total_budget - len(selected_indices),
+                anchor_indices=anchor_indices + selected_indices,
+            )
+            selected_indices.extend(additional)
+
+        groups = {
+            "diverse": [queries[index].content for index in diverse],
+            "boundary": [queries[index].content for index in boundary],
+            "additional": [queries[index].content for index in additional],
         }
+        return groups, selected_indices
 
     def _allocate_sample_budget(self, total_budget: int) -> Dict[str, int]:
         if total_budget <= 0:
@@ -293,6 +376,28 @@ class ClusteringService:
 
         return {
             "representative": representative,
+            "diverse": diverse,
+            "boundary": boundary,
+        }
+
+    def _allocate_inspect_budget(self, total_budget: int) -> Dict[str, int]:
+        if total_budget <= 0:
+            return {"diverse": 0, "boundary": 0}
+        if total_budget == 1:
+            return {"diverse": 1, "boundary": 0}
+
+        boundary = max(1, round(total_budget * 0.375))
+        diverse = max(1, total_budget - boundary)
+
+        while diverse + boundary > total_budget:
+            if diverse >= boundary and diverse > 1:
+                diverse -= 1
+            elif boundary > 1:
+                boundary -= 1
+            else:
+                break
+
+        return {
             "diverse": diverse,
             "boundary": boundary,
         }
@@ -408,17 +513,25 @@ class ClusteringService:
 
         return (values - min_value) / (max_value - min_value)
 
-    def _compute_novelty_score(
+    def _compute_novelty_metrics(
         self,
         queries: List[Query],
         embeddings: np.ndarray,
         new_query_ids: List[str],
         reference_query_ids: List[str],
-    ) -> float:
+    ) -> Dict[str, float]:
         if not new_query_ids:
-            return 0.0
+            return {
+                "novelty_score": 0.0,
+                "relative_novelty": 0.0,
+                "novelty_ratio": 0.0,
+            }
         if not reference_query_ids:
-            return 1.0
+            return {
+                "novelty_score": 1.0,
+                "relative_novelty": 1.0,
+                "novelty_ratio": 1.0,
+            }
 
         id_to_index = {query.id: index for index, query in enumerate(queries)}
         new_indices = [id_to_index[query_id] for query_id in new_query_ids if query_id in id_to_index]
@@ -428,15 +541,46 @@ class ClusteringService:
             if query_id in id_to_index
         ]
         if not new_indices:
-            return 0.0
+            return {
+                "novelty_score": 0.0,
+                "relative_novelty": 0.0,
+                "novelty_ratio": 0.0,
+            }
         if not reference_indices:
-            return 1.0
+            return {
+                "novelty_score": 1.0,
+                "relative_novelty": 1.0,
+                "novelty_ratio": 1.0,
+            }
 
         new_vectors = self._l2_normalize(embeddings[new_indices])
         reference_vectors = self._l2_normalize(embeddings[reference_indices])
         cosine_similarity = np.clip(new_vectors @ reference_vectors.T, -1.0, 1.0)
         cosine_distance = 1.0 - cosine_similarity
-        return float(np.min(cosine_distance, axis=1).mean())
+        min_distances = np.min(cosine_distance, axis=1)
+        novelty_score = float(min_distances.mean())
+
+        cluster_radius = self._estimate_cluster_radius(embeddings)
+        novelty_distance_threshold = max(cluster_radius * 0.35, 1e-6)
+        novelty_ratio = float(np.mean(min_distances >= novelty_distance_threshold))
+        relative_novelty = float(novelty_score / max(cluster_radius, 1e-6))
+
+        return {
+            "novelty_score": novelty_score,
+            "relative_novelty": relative_novelty,
+            "novelty_ratio": novelty_ratio,
+        }
+
+    def _estimate_cluster_radius(self, embeddings: np.ndarray) -> float:
+        if len(embeddings) <= 1:
+            return 1.0
+
+        normalized_embeddings = self._l2_normalize(embeddings)
+        centroid = normalized_embeddings.mean(axis=0, keepdims=True)
+        centroid = self._l2_normalize(centroid)
+        cosine_similarity = np.clip(normalized_embeddings @ centroid.T, -1.0, 1.0)
+        cosine_distance = 1.0 - cosine_similarity.reshape(-1)
+        return float(max(np.percentile(cosine_distance, 75), 1e-6))
 
     def _l2_normalize(self, values: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(values, axis=1, keepdims=True)
