@@ -20,6 +20,11 @@ embedding:
   retry_delay_seconds: 1.0
   timeout: 60
 
+pricing:
+  embedding_input_per_million_tokens: 0.7
+  llm_input_per_million_tokens: 0.2
+  llm_output_per_million_tokens: 2.0
+
 system:
   recursion_limit: 2000
 

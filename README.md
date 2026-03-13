@@ -4,6 +4,12 @@ Dynamic intent taxonomy induction for unlabeled queries.
 
 TDRCluster 是一个面向无标签文本数据的意图发现项目。它的目标不是把数据强行压进预先设定好的类别数，而是从原始 query 中逐步形成一套稳定、可复用、可解释的 taxonomy。
 
+当前仓库同时包含一个面向用户的本地产品壳：
+
+- 产品名：`IntentAtlas`
+- 技术引擎：`TDRCluster`
+- 目标体验：上传 `CSV / Excel`，在 UI 中完成预检查、运行、浏览结果，并导出单文件 `agent_report.md`
+
 项目当前采用三段式流程：
 
 - 用 `Embedding + UMAP + HDBSCAN` 完成物理切分与去噪
@@ -91,7 +97,21 @@ pip install -r requirements.txt
 cp config/config.example.yaml config/config.yaml
 ```
 
-然后：
+如果你想直接体验产品形态，优先启动 `IntentAtlas` 本地 UI：
+
+```bash
+streamlit run app.py
+```
+
+然后在浏览器中：
+
+1. 在侧边栏填写 LLM 与 embedding 配置
+2. 拖入 `CSV / Excel` 文件
+3. 选择 `query` 列并查看预检查结果
+4. 先跑 `preview` 或直接跑全量
+5. 在结果页下载单文件 `agent_report.md`
+
+如果你想继续使用原始命令行流程：
 
 1. 在 `config/config.yaml` 中填写 LLM 与 embedding 配置
 2. 将原始数据放入 `data/raw_data/`
@@ -118,12 +138,14 @@ python build_hierarchy.py output/<summary_json>
 层级化流程会额外生成：
 
 - `output/<dataset>_hierarchy_<timestamp>.json`
+- `output/<dataset>_agent_report_<timestamp>.md`
 
 其中：
 
 - `clustering.csv` 记录 query 到叶子类别的映射
 - `summary.json` 记录最终 flat taxonomy 与 residual 信息
 - `hierarchy.json` 记录 post-hoc 生成的层级树
+- `agent_report.md` 是默认面向分析与二次 LLM 讨论的单文件导出
 
 原始输入可以是：
 
@@ -170,3 +192,9 @@ TDRCluster 适合以下场景：
 - 标注体系建立前的探索性 taxonomy induction
 
 如果你的目标是从无标签 query 中得到一套尽量稳定、可解释、可扩展的类别结构，而不是只跑一次静态聚类，这个项目就是为此设计的。
+
+## Product Roadmap
+
+`IntentAtlas` 的 V1-V2 产品规划已写入：
+
+- `docs/intentatlas_product_plan.md`

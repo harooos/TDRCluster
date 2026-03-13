@@ -3,7 +3,7 @@ LangGraph流程编排模块
 实现TDRCluster V2的完整工作流：splitter -> reviewer -> dispatcher
 """
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from collections import deque
 
 from langgraph.graph import StateGraph, END
@@ -19,15 +19,25 @@ from .tools import (
 )
 from .prompts import create_cluster_display_dict, create_category_display_dict
 from services.clustering_service import ClusteringService
+from services.run_control import CancelCallback, check_cancelled
 
 
 class TDRClusterGraph:
     """TDRCluster V2主工作流"""
 
-    def __init__(self, llm_service):
+    def __init__(
+        self,
+        llm_service,
+        observer: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        should_cancel: CancelCallback = None,
+        checkpoint_callback: Optional[Callable[[GraphState], None]] = None,
+    ):
         self.llm_service = llm_service
         self.clustering_service = ClusteringService()
         self.inspect_config = CONFIG.get("clustering", {}).get("inspect", {})
+        self.observer = observer
+        self.should_cancel = should_cancel
+        self.checkpoint_callback = checkpoint_callback
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -54,11 +64,23 @@ class TDRClusterGraph:
 
     def splitter_node(self, state: GraphState) -> Dict[str, Any]:
         """切分节点：从BFS队列取任务，执行一次物理切分"""
+        check_cancelled(self.should_cancel)
         print("🔵 进入splitter节点")
 
         existing_clusters = state.get("clusters_list", [])
         if existing_clusters:
             print(f"   当前仍有 {len(existing_clusters)} 个micro-cluster待评审，跳过切分")
+            next_state = self._build_next_state(
+                state,
+                {
+                    "tasks": state.get("tasks", deque()),
+                    "categories": state.get("categories", {}),
+                    "clusters_list": existing_clusters,
+                    "current_cluster": None,
+                    "residual_clusters": state.get("residual_clusters", []),
+                },
+            )
+            self._checkpoint(next_state)
             return {
                 "tasks": state.get("tasks", deque()),
                 "categories": state.get("categories", {}),
@@ -70,6 +92,17 @@ class TDRClusterGraph:
         tasks = state["tasks"]
         if not tasks:
             print("   队列为空，跳过切分")
+            next_state = self._build_next_state(
+                state,
+                {
+                    "tasks": tasks,
+                    "categories": state.get("categories", {}),
+                    "clusters_list": [],
+                    "current_cluster": None,
+                    "residual_clusters": state.get("residual_clusters", []),
+                },
+            )
+            self._checkpoint(next_state)
             return {
                 "tasks": tasks,
                 "categories": state.get("categories", {}),
@@ -83,11 +116,31 @@ class TDRClusterGraph:
             current_task,
             state["total_queries"],
         )
+        check_cancelled(self.should_cancel)
 
         all_residual_clusters = list(state.get("residual_clusters", []))
         all_residual_clusters.extend(residual_clusters)
 
         print(f"   切分完成: review={len(review_clusters)}, residual={len(residual_clusters)}")
+        self._emit(
+            "splitter_completed",
+            task_id=current_task.id,
+            depth=current_task.depth,
+            review_cluster_count=len(review_clusters),
+            residual_cluster_count=len(residual_clusters),
+            pending_tasks=len(tasks),
+        )
+        next_state = self._build_next_state(
+            state,
+            {
+                "tasks": tasks,
+                "categories": state.get("categories", {}),
+                "clusters_list": review_clusters,
+                "current_cluster": None,
+                "residual_clusters": all_residual_clusters,
+            },
+        )
+        self._checkpoint(next_state)
         return {
             "tasks": tasks,
             "categories": state.get("categories", {}),
@@ -98,6 +151,7 @@ class TDRClusterGraph:
 
     def reviewer_node(self, state: GraphState) -> Dict[str, Any]:
         """评审节点：一次只调用LLM评审一个micro-cluster"""
+        check_cancelled(self.should_cancel)
         print("🟡 进入reviewer节点")
 
         clusters_to_review = state.get("clusters_list", [])
@@ -126,11 +180,25 @@ class TDRClusterGraph:
                 f"{len(current_cluster.queries)} 个query, "
                 f"剩余待审 {len(remaining_clusters)} 个micro-cluster"
             )
+            self._emit(
+                "reviewer_started",
+                cluster_id=current_cluster.id,
+                query_count=len(current_cluster.queries),
+                remaining_microclusters=len(remaining_clusters),
+                category_count=len(categories),
+            )
             current_cluster.judge = self.llm_service.analyze_cluster_with_retry(
                 finalized_categories,
                 create_cluster_display_dict(current_cluster),
             )
+            check_cancelled(self.should_cancel)
             print(f"   ✓ {current_cluster.id} 决策: {current_cluster.judge.get('action')}")
+            self._emit(
+                "reviewer_completed",
+                cluster_id=current_cluster.id,
+                action=current_cluster.judge.get("action"),
+                category_count=len(categories),
+            )
         except Exception as e:
             print(f"❌ LLM分析失败: {str(e)}")
             raise
@@ -145,6 +213,7 @@ class TDRClusterGraph:
 
     def dispatcher_node(self, state: GraphState) -> Dict[str, Any]:
         """分发节点：根据单个LLM决策更新taxonomy或继续切分"""
+        check_cancelled(self.should_cancel)
         print("🟢 进入dispatcher节点")
 
         current_cluster = state.get("current_cluster")
@@ -196,6 +265,17 @@ class TDRClusterGraph:
                     current_cluster,
                     decision.get("reason", "need_more_evidence"),
                 )
+                next_state = self._build_next_state(
+                    state,
+                    {
+                        "tasks": state.get("tasks", deque()),
+                        "categories": state.get("categories", {}),
+                        "clusters_list": updated_clusters,
+                        "current_cluster": None,
+                        "residual_clusters": state.get("residual_clusters", []),
+                    },
+                )
+                self._checkpoint(next_state)
                 return {
                     "tasks": state.get("tasks", deque()),
                     "categories": state.get("categories", {}),
@@ -207,6 +287,27 @@ class TDRClusterGraph:
                 record_residual_cluster_tool(state, current_cluster, f"未知动作: {action}")
         except Exception as e:
             record_residual_cluster_tool(state, current_cluster, f"处理失败: {str(e)}")
+
+        self._emit(
+            "dispatcher_completed",
+            cluster_id=current_cluster.id,
+            action=action,
+            category_count=len(state.get("categories", {})),
+            residual_count=len(state.get("residual_clusters", [])),
+            pending_tasks=len(state.get("tasks", deque())),
+            pending_microclusters=len(state.get("clusters_list", [])),
+        )
+        next_state = self._build_next_state(
+            state,
+            {
+                "tasks": state.get("tasks", deque()),
+                "categories": state.get("categories", {}),
+                "clusters_list": state.get("clusters_list", []),
+                "current_cluster": None,
+                "residual_clusters": state.get("residual_clusters", []),
+            },
+        )
+        self._checkpoint(next_state)
 
         return {
             "tasks": state.get("tasks", deque()),
@@ -236,6 +337,7 @@ class TDRClusterGraph:
         cluster: MicroCluster,
         inspect_reason: str,
     ) -> List[MicroCluster]:
+        check_cancelled(self.should_cancel)
         normalized_reason = inspect_reason.strip() or "need_more_evidence"
         previous_reasons = list(cluster.inspect_reasons)
         additional_evidence = self.clustering_service.sample_additional_evidence(cluster)
@@ -277,6 +379,17 @@ class TDRClusterGraph:
                 f"relative_novelty={additional_evidence.get('relative_novelty', 0.0):.2f}, "
                 f"coverage={additional_evidence.get('coverage_ratio', 0.0):.2%}"
             )
+
+        self._emit(
+            "inspect_completed",
+            cluster_id=cluster.id,
+            next_round=cluster.inspect_round,
+            added_samples=len(additional_evidence.get("query_ids", [])),
+            novelty_ratio=float(additional_evidence.get("novelty_ratio", 0.0)),
+            coverage_ratio=float(additional_evidence.get("coverage_ratio", 0.0)),
+            forced_final=should_force_final,
+            stop_reason=stop_reason,
+        )
 
         return [cluster] + list(state.get("clusters_list", []))
 
@@ -332,37 +445,83 @@ class TDRClusterGraph:
         normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", reason.lower())
         return " ".join(normalized.split())
 
-    def run(self, initial_queries: List[Query]) -> Dict[str, Any]:
+    def run(
+        self,
+        initial_queries: Optional[List[Query]] = None,
+        initial_state: Optional[GraphState] = None,
+    ) -> Dict[str, Any]:
         """运行完整的TDRCluster V2流程"""
+        check_cancelled(self.should_cancel)
         print("🚀 开始TDRCluster V2流程")
-        print(f"   初始数据: {len(initial_queries)} 个查询")
+        if initial_state is None and initial_queries is None:
+            raise ValueError("initial_queries 和 initial_state 不能同时为空")
+
+        if initial_state is None:
+            print(f"   初始数据: {len(initial_queries)} 个查询")
+        else:
+            print(f"   从断点恢复，待处理任务数: {len(initial_state.get('tasks', deque()))}")
         print("   物理切分引擎: UMAP + HDBSCAN")
+        working_state = initial_state
 
-        total_queries = len(initial_queries)
-        min_cluster_size = self.clustering_service.calculate_min_cluster_size(total_queries)
-        max_split_depth = CONFIG.get("clustering", {}).get("max_split_depth", 4)
+        if working_state is None:
+            total_queries = len(initial_queries)
+            min_cluster_size = self.clustering_service.calculate_min_cluster_size(total_queries)
+            max_split_depth = CONFIG.get("clustering", {}).get("max_split_depth", 4)
 
-        initial_task = SplitTask(
-            queries=initial_queries,
-            depth=0,
-            parent_cluster_id=None,
-            split_reason="root",
-        )
-        initial_state: GraphState = {
-            "tasks": deque([initial_task]),
-            "categories": {},
-            "clusters_list": [],
-            "current_cluster": None,
-            "residual_clusters": [],
-            "total_queries": total_queries,
-            "min_cluster_size": min_cluster_size,
-            "max_split_depth": max_split_depth,
-        }
+            initial_task = SplitTask(
+                queries=initial_queries,
+                depth=0,
+                parent_cluster_id=None,
+                split_reason="root",
+            )
+            working_state = {
+                "tasks": deque([initial_task]),
+                "categories": {},
+                "clusters_list": [],
+                "current_cluster": None,
+                "residual_clusters": [],
+                "total_queries": total_queries,
+                "min_cluster_size": min_cluster_size,
+                "max_split_depth": max_split_depth,
+            }
+
+        self._emit("run_started", total_queries=working_state["total_queries"])
+        self._checkpoint(working_state)
 
         recursion_limit = CONFIG.get("system", {}).get("recursion_limit", 100)
-        final_state = self.graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
+        final_state = self.graph.invoke(working_state, config={"recursion_limit": recursion_limit})
+        check_cancelled(self.should_cancel)
 
         print("✅ TDRCluster V2流程完成")
         print(f"   最终类别数: {len(final_state.get('categories', {}))}")
         print(f"   残差簇数: {len(final_state.get('residual_clusters', []))}")
+        self._emit(
+            "run_finished",
+            category_count=len(final_state.get("categories", {})),
+            residual_count=len(final_state.get("residual_clusters", [])),
+        )
         return final_state
+
+    def _emit(self, event: str, **payload):
+        if self.observer:
+            self.observer(event, payload)
+
+    def _checkpoint(self, state: GraphState):
+        if self.checkpoint_callback:
+            self.checkpoint_callback(state)
+
+    def _build_next_state(
+        self,
+        state: GraphState,
+        updates: Dict[str, Any],
+    ) -> GraphState:
+        return {
+            "tasks": updates.get("tasks", state.get("tasks", deque())),
+            "categories": updates.get("categories", state.get("categories", {})),
+            "clusters_list": updates.get("clusters_list", state.get("clusters_list", [])),
+            "current_cluster": updates.get("current_cluster", state.get("current_cluster")),
+            "residual_clusters": updates.get("residual_clusters", state.get("residual_clusters", [])),
+            "total_queries": state["total_queries"],
+            "min_cluster_size": state["min_cluster_size"],
+            "max_split_depth": state["max_split_depth"],
+        }

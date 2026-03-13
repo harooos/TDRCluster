@@ -4,11 +4,12 @@
 import pickle
 import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 
 from config.config_loader import CONFIG
 from .embedding_service import EmbeddingService
 from core.state import Query
+from services.run_control import CancelCallback, check_cancelled
 
 
 class DatasetManager:
@@ -16,7 +17,11 @@ class DatasetManager:
 
     SUPPORTED_RAW_EXTENSIONS = (".csv", ".xlsx", ".xlsm", ".xls")
 
-    def __init__(self):
+    def __init__(
+        self,
+        observer: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        should_cancel: CancelCallback = None,
+    ):
         self.config = CONFIG
         # 硬编码路径设置
         self.base_path = Path("data")
@@ -28,6 +33,8 @@ class DatasetManager:
         self.processed_path.mkdir(parents=True, exist_ok=True)
 
         self.embedding_service = EmbeddingService()
+        self.observer = observer
+        self.should_cancel = should_cancel
 
     def _has_embeddings(self, dataset_name: str) -> bool:
         """检查数据集是否已有embeddings"""
@@ -151,6 +158,7 @@ class DatasetManager:
         # 读取原始数据
         df = self._normalize_dataframe(self._load_raw_dataframe(raw_file), raw_file)
         print(f"   读取到 {len(df)} 条记录")
+        self._emit("embedding_started", dataset_name=dataset_name, total_rows=len(df))
 
         # 准备数据
         embedding_service = self.embedding_service
@@ -169,6 +177,7 @@ class DatasetManager:
         start_index = progress["next_index"]
 
         for batch_start in range(start_index, len(df), batch_size):
+            check_cancelled(self.should_cancel)
             batch_end = min(batch_start + batch_size, len(df))
             batch_df = df.iloc[batch_start:batch_end]
 
@@ -189,6 +198,12 @@ class DatasetManager:
 
                 self._save_embedding_progress(dataset_name, batch_end, data_for_embedding)
                 print(f"   进度: {batch_end}/{len(df)} (批次处理)")
+                self._emit(
+                    "embedding_progress",
+                    dataset_name=dataset_name,
+                    completed_rows=batch_end,
+                    total_rows=len(df),
+                )
 
             except Exception as e:
                 print(f"   警告: 批次 {batch_start}-{batch_end} 失败，错误: {e}")
@@ -215,6 +230,11 @@ class DatasetManager:
         saved_path = embedding_service.save_embeddings(data_for_embedding, dataset_name)
         self._clear_embedding_progress(dataset_name)
         print(f"✓ Embeddings已保存到: {saved_path}")
+        self._emit(
+            "embedding_completed",
+            dataset_name=dataset_name,
+            total_rows=len(data_for_embedding),
+        )
 
         return saved_path
 
@@ -233,8 +253,11 @@ class DatasetManager:
         if not self._has_embeddings(dataset_name):
             print(f"⚠️ 数据集 {dataset_name} 没有embeddings，开始生成...")
             self.generate_embeddings(dataset_name)
-        
+        else:
+            self._emit("embedding_reused", dataset_name=dataset_name)
+
         # 加载数据
+        check_cancelled(self.should_cancel)
         embedding_service = self.embedding_service
         data = embedding_service.load_embeddings(dataset_name)
 
@@ -259,3 +282,7 @@ class DatasetManager:
 
         print(f"✓ 准备完成 {len(queries)} 个Query对象")
         return queries
+
+    def _emit(self, event: str, **payload):
+        if self.observer:
+            self.observer(event, payload)
