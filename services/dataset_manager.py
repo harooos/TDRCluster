@@ -3,6 +3,8 @@
 """
 import pickle
 import pandas as pd
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -164,35 +166,45 @@ class DatasetManager:
         progress = self._load_embedding_progress(dataset_name)
 
         # 批量处理
-        batch_size = 256
+        batch_size = 10
         data_for_embedding = progress["data"]
         start_index = progress["next_index"]
 
-        for batch_start in range(start_index, len(df), batch_size):
-            batch_end = min(batch_start + batch_size, len(df))
-            batch_df = df.iloc[batch_start:batch_end]
+        batch_bounds = [(bs, min(bs + batch_size, len(df))) for bs in range(start_index, len(df), batch_size)]
+        max_workers = int(self.config.get("embedding", {}).get("max_concurrency", 8) or 8)
+        lock = threading.Lock()
+        failed_batches: list = []
 
+        def _embed_batch(batch_range):
+            batch_start, batch_end = batch_range
+            batch_df = df.iloc[batch_start:batch_end]
             try:
-                # 批量获取embeddings
                 texts = [str(row["query"]) for _, row in batch_df.iterrows()]
                 embeddings = embedding_service.get_embeddings(texts)
-
-                # 组装数据
-                for (_, row), embedding in zip(batch_df.iterrows(), embeddings):
-                    data_for_embedding.append(
-                        {
-                            "query": row["query"],
-                            "category": row.get("category", ""),
-                            "embedding": embedding,
-                        }
-                    )
-
-                self._save_embedding_progress(dataset_name, batch_end, data_for_embedding)
-                print(f"   进度: {batch_end}/{len(df)} (批次处理)")
-
+                assembled = [
+                    {
+                        "query": row["query"],
+                        "category": row.get("category", ""),
+                        "embedding": embedding,
+                    }
+                    for (_, row), embedding in zip(batch_df.iterrows(), embeddings)
+                ]
+                with lock:
+                    data_for_embedding.extend(assembled)
+                    self._save_embedding_progress(dataset_name, batch_end, data_for_embedding)
+                    print(f"   进度: {batch_end}/{len(df)} (批次处理)")
             except Exception as e:
+                with lock:
+                    failed_batches.append((batch_start, batch_end, str(e)[:160]))
                 print(f"   警告: 批次 {batch_start}-{batch_end} 失败，错误: {e}")
-                continue
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_embed_batch, batch_bounds))
+
+        if failed_batches:
+            for bs, be, msg in failed_batches[:5]:
+                print(f"   失败批次明细: {bs}-{be}: {msg}")
+            print(f"   共 {len(failed_batches)} 个批次失败")
 
         # 验证生成的数据完整性
         if len(data_for_embedding) == 0:

@@ -3,6 +3,7 @@
 TDRCluster主启动文件
 """
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -87,6 +88,31 @@ def save_results(final_state: dict, output_dir: str, dataset_name: str) -> tuple
             "evidence_rounds": cluster.evidence_rounds,
             "reason": (cluster.judge or {}).get("residual_reason", "unspecified"),
         }
+
+    mongo_uri = os.environ.get("MONGO_URI")
+    if mongo_uri:
+        try:
+            from pymongo import MongoClient
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=8000)
+            col = client["ai_agent"]["large_intent_cluster"]
+            version = os.environ.get("CLUSTER_VERSION", timestamp)
+            docs = []
+            for category in categories.values():
+                for query in category.queries:
+                    docs.append({
+                        "query_id": query.id, "case_model": query.id,
+                        "content": query.content,
+                        "category_id": category.id, "category_name": category.name,
+                        "category_definition": category.definition,
+                        "boundary_notes": category.boundary_notes,
+                        "version": version, "dataset": dataset_name,
+                        "created_at": datetime.utcnow(),
+                    })
+            if docs:
+                col.insert_many(docs, ordered=False)
+                print(f"   ✓ Mongo 落账: ai_agent.large_intent_cluster {len(docs)} 行 (version={version})")
+        except Exception as exc:
+            print(f"   ⚠️ Mongo 落账失败: {exc}")
 
     json_path = output_path / f"{dataset_name}_summary_{timestamp}.json"
     with open(json_path, "w", encoding="utf-8") as file:

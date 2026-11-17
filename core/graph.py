@@ -357,6 +357,8 @@ class TDRClusterGraph:
             "total_queries": total_queries,
             "min_cluster_size": min_cluster_size,
             "max_split_depth": max_split_depth,
+            "split_review_budget": int(total_queries * CONFIG.get("clustering", {}).get("split_review_budget_ratio", 1.35)),
+            "split_review_volume": 0,
         }
 
         recursion_limit = CONFIG.get("system", {}).get("recursion_limit", 100)

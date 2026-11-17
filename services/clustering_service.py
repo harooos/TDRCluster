@@ -87,9 +87,14 @@ class ClusteringService:
                 is_noise=(label == -1),
             )
 
-            if label == -1:
+            if label == -1 and len(cluster_queries) < min_cluster_size:
+                # 小噪声簇无归类价值，直接进残差
                 residual_clusters.append(cluster)
             else:
+                # 大噪声簇(>=min_cluster_size)必须送评审: HDBSCAN 密度失败 != 无意图,
+                # 松散语义集正是 LLM curator 的价值区(否则语料 38% 静默损失)
+                if label == -1:
+                    print(f"   大噪声簇 {cluster.id}({len(cluster_queries)}例) 转入评审队列")
                 review_clusters.append(cluster)
 
         self._print_cluster_summary(review_clusters, residual_clusters)

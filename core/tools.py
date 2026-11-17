@@ -97,6 +97,18 @@ def enqueue_resplit_task_tool(state: GraphState, cluster: MicroCluster, split_re
         )
         return
 
+    split_budget = state.get("split_review_budget")
+    if split_budget is not None:
+        used = state.get("split_review_volume", 0) + len(cluster.queries)
+        if used > split_budget:
+            record_residual_cluster_tool(
+                state,
+                cluster,
+                f"切分重评审预算耗尽({used}>{split_budget}), 强制残差",
+            )
+            return
+        state["split_review_volume"] = used
+
     new_task = SplitTask(
         queries=list(cluster.queries),
         depth=cluster.depth + 1,

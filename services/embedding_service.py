@@ -28,6 +28,16 @@ class EmbeddingService:
     def _init_client(self):
         """初始化embedding客户端"""
         try:
+            if self.api_style == 'local':
+                import os
+                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+                from sentence_transformers import SentenceTransformer
+                self.local_model = SentenceTransformer(
+                    self.config.get('model_name', 'BAAI/bge-small-zh-v1.5'),
+                    device=self.config.get('device', 'mps'),
+                )
+                print("✓ 本地embedding模型就绪:", self.config.get('model_name'))
+                return
             api_key = self.config.get('api_key')
             
             if not api_key:
@@ -42,6 +52,14 @@ class EmbeddingService:
                 )
             elif self.api_style == 'ark_multimodal':
                 self.client = True
+            elif self.api_style == 'local':
+                import os
+                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+                from sentence_transformers import SentenceTransformer
+                self.local_model = SentenceTransformer(
+                    self.config.get('model_name', 'BAAI/bge-small-zh-v1.5'),
+                    device=self.config.get('device', 'mps'),
+                )
             else:
                 raise ValueError(f"不支持的embedding api_style: {self.api_style}")
 
@@ -54,7 +72,7 @@ class EmbeddingService:
     
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """批量获取文本的embedding向量"""
-        if not self.client:
+        if not self.client and not getattr(self, "local_model", None):
             raise RuntimeError("Embedding客户端未初始化")
         
         if not texts:
@@ -62,6 +80,10 @@ class EmbeddingService:
             
         try:
             cleaned_texts = [text.replace("\n", " ") for text in texts]
+            if self.api_style == 'local':
+                vecs = self.local_model.encode(cleaned_texts, batch_size=256,
+                    normalize_embeddings=True, show_progress_bar=False)
+                return [v.tolist() for v in vecs]
             if self.api_style == 'openai':
                 response = self.client.embeddings.create(
                     input=cleaned_texts,

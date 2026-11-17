@@ -13,3 +13,6 @@ tqdm
 numpy
 umap-learn
 hdbscan
+pymongo
+sentence-transformers
+torch

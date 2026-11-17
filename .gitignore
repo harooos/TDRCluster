@@ -66,3 +66,7 @@ test_*.py
 # Development artifacts
 backup/
 temp/
+
+# 数据与产物不入库
+output/
+data/
